@@ -6,7 +6,7 @@ started by writing a prompt into `my_secrets.py`.
 
 This edition runs fully locally on Mac, Windows and Linux, can be set up and run by someone else with two commands
 and their own Hugging Face token, and supports 15 languages. The changes are grouped below by purpose; file names
-point to where each change lives. None of the changes have been committed to git yet.
+point to where each change lives. 
 
 ---
 
@@ -54,6 +54,15 @@ New files:
 - `llm.main()` accepts the audio folder and language directly (`main(prompt, audio_dir=..., lang_code=...)`);
   the original parsed a POSIX path out of the prompt, which cannot work for Windows paths.
 - The user's audio folder is never modified: files are copied to `<audio>_qc/<language>/audios`.
+
+- Offline runs: when huggingface.co is unreachable (or `HF_HUB_OFFLINE=1`), the token check is skipped and the
+  models already in the local cache are used.
+- `prepare_runs.py` keeps the copies in sync with the source folder (changed files re-copied, deleted files
+  removed, stale references cleared), skips macOS `._*` metadata files, and matches a transcript JSON to its audio
+  by exact name or by the audio name as a whole token (`sample_1` no longer also matches `sample_10_x.json`).
+- IndicLID is downloaded with progress into a temporary folder and moved into place only when complete.
+- Git: `setup.sh` / `run.sh` are stored executable; `.gitattributes` keeps `.sh`/`.py` LF and `.bat`/`.ps1` CRLF
+  regardless of the user's `core.autocrlf`.
 
 ## 4. Gated models and fallbacks
 
@@ -111,6 +120,6 @@ with the fallbacks.
 ## 8. Other edits
 
 - `README.md` rewritten as a user guide; this file and `implementation.md` added.
-- `.gitignore`: `.venv/`, `models/`, `pipeline.log`, `__pycache__/`, `log.txt`, `*_qc/`.
+- `.gitignore`: `.venv/`, `models/`, `pipeline.log`, `__pycache__/`, `log.txt`, `*_qc/`; `.gitattributes` for line endings.
 - `env/denv.yml`: line endings only (CRLF → LF); content unchanged.
 - `my_secrets.py`: example prompt updated; no keys stored.

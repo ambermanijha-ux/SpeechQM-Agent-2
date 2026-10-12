@@ -11,6 +11,7 @@ Usage: python prepare_runs.py <dataset folder> <output folder> [default language
 """
 import csv
 import json
+import re
 import shutil
 import sys
 from collections import defaultdict
@@ -42,17 +43,32 @@ def transcript_text(json_path: Path) -> str:
                     if s["text"].strip())
 
 
+def transcript_for(audio: Path, jsons) -> Path:
+    """The transcript JSON of an audio file: same folder, same stem (hi001.json), else a name containing the stem
+    as a whole token (Copy of hi001_human_transcribed.json; sample_1 does not match sample_10_x.json)."""
+    here = [j for j in jsons if j.parent == audio.parent]
+    exact = [j for j in here if j.stem == audio.stem]
+    if exact:
+        return exact[0]
+    token = re.compile(rf"(?<![0-9A-Za-z]){re.escape(audio.stem)}(?![0-9A-Za-z])")
+    match = [j for j in here if token.search(j.stem)]
+    if len(match) > 1:
+        print(f"  {audio.name}: several transcripts match ({', '.join(j.name for j in match)}); none used")
+    return match[0] if len(match) == 1 else None
+
+
 def main(src: Path, out: Path, default_language=None) -> dict:
     """Returns {language: run folder}."""
     if default_language and default_language.lower() not in LANGUAGES:
         raise ValueError(f"unknown language {default_language}; supported: {', '.join(sorted(LANGUAGES))}")
     audio = defaultdict(list)
     for p in sorted(src.rglob("*")):
-        if p.is_file() and p.suffix.lower() in AUDIO_EXT and out not in p.parents:
+        # "._x.wav": macOS metadata files on external drives / in zips, not audio
+        if p.is_file() and p.suffix.lower() in AUDIO_EXT and not p.name.startswith(".") and out not in p.parents:
             audio[language(p, src, default_language)].append(p)
     if not audio:
         raise ValueError(f"no .wav/.mp3/.flac files under {src}")
-    jsons = [p for p in src.rglob("*.json") if p.is_file()]
+    jsons = [p for p in src.rglob("*.json") if p.is_file() and not p.name.startswith(".")]
     for lang, files in sorted(audio.items()):
         dest = out / lang / "audios"
         dest.mkdir(parents=True, exist_ok=True)
@@ -61,16 +77,23 @@ def main(src: Path, out: Path, default_language=None) -> dict:
             if f.name in names:
                 raise ValueError(f"two {lang} files are named {f.name}; rename one first")
             names.add(f.name)
-            if not (dest / f.name).exists():
-                shutil.copy2(f, dest / f.name)
-            match = [j for j in jsons if j.parent == f.parent and f.stem in j.stem]
-            if len(match) == 1:
+            copy = dest / f.name
+            # copy2 keeps the modification time: a changed source file (new size or time) is copied again
+            if not copy.exists() or (copy.stat().st_size, int(copy.stat().st_mtime)) != \
+                    (f.stat().st_size, int(f.stat().st_mtime)):
+                shutil.copy2(f, copy)
+            transcript = transcript_for(f, jsons)
+            if transcript:
                 try:
-                    rows.append((f.name, transcript_text(match[0])))
-                except (ValueError, KeyError, TypeError) as e:
-                    print(f"  skipped transcript {match[0].name}: not the expected segments JSON ({e})")
+                    rows.append((f.name, transcript_text(transcript)))
+                except (ValueError, KeyError, TypeError, AttributeError) as e:
+                    print(f"  skipped transcript {transcript.name}: not the expected segments JSON ({e})")
+        for old in dest.iterdir():   # files removed from the source since an earlier run
+            if old.name not in names:
+                old.unlink()
         res = out / lang / "results"
         res.mkdir(exist_ok=True)
+        (res / "indicconf_hypothesis-gt.csv").unlink(missing_ok=True)
         if rows:
             with open(res / "indicconf_hypothesis-gt.csv", "w", newline="", encoding="utf-8") as fh:
                 w = csv.writer(fh)

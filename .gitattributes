@@ -1,0 +1,5 @@
+# keep shell scripts LF (bash fails on CRLF) and Windows scripts CRLF, whatever core.autocrlf is set to
+*.sh   text eol=lf
+*.py   text eol=lf
+*.bat  text eol=crlf
+*.ps1  text eol=crlf

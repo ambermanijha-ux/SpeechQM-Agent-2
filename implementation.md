@@ -32,7 +32,9 @@ run.sh / run.bat <audio> [--language X] [--prompt "..."]
  │     audio found recursively; language = nearest parent folder named after a language, else --language
  │     transcript JSON in the same folder whose stem contains the audio stem → reference row
  │
- ├─ 2 token: --token | HF_TOKEN | saved login | ask (getpass) → whoami() → login() saves it
+ ├─ 2 offline (huggingface.co unreachable or HF_HUB_OFFLINE=1)? → HF_HUB_OFFLINE=1, use cached models only,
+ │     pyannote if it is in the cache, else the local backend
+ │   token: --token | HF_TOKEN | saved login | ask (getpass) → whoami() → login() saves it
  │     check_gated(): auth_check() on pyannote repos + gated ASR candidates of the languages found
  │       pyannote blocked → SPEECH_BACKEND = "local"; ai4bharat blocked → its Vakyansh fallback is used later
  │
@@ -211,6 +213,10 @@ qwen3 so replies contain only the answer. The planner and coder are the same `qw
 ```
 
 - Reference JSON: `{"segments": [{"text": str, "start_time": float, ...}]}`; segment texts are joined in time order.
+  It belongs to the audio file in the same folder with the same name, else whose name contains the audio name as
+  a whole token; several candidates → none is used (reported).
+- `prepare_runs` re-syncs on every run: changed source files (size or modification time) are copied again,
+  files no longer in the source are removed from `audios/`, the reference CSV is rebuilt; `._*` files are ignored.
 - Results always go to `results/` next to the audio folder (`llm.results_dir`).
 - `summarize.COLUMNS` maps each result file's columns (case-insensitive, `*` wildcards) to summary columns.
 
@@ -256,6 +262,9 @@ of the folder name to `prepare_runs.ALIASES`.
 | Full check set on Tamil and Telugu folders (mp3 + wav, 8–48 kHz) | all checks completed; 2 Telugu calls correctly share a speaker |
 | Clean Ubuntu 24.04 container (arm64, CPU only, no token): `setup.sh` then `run.sh` on Hindi + Telugu | completed: Vakyansh Hindi fallback, local speaker backend, IndicLID downloaded, summary written |
 | Windows: dependency resolution for `x86_64-pc-windows-msvc` | all 150 packages resolve; every PyPI package has a prebuilt Windows wheel |
+| Mac: `setup.sh` on the existing environment, full run, forced-offline run (`HF_HUB_OFFLINE=1`) | all completed; offline results identical |
+| `prepare_runs` edge cases (hidden `._` file, `sample_1` vs `sample_10`, changed / deleted source files, removed transcripts) | all handled |
+| `shellcheck` on `setup.sh` / `run.sh`; PowerShell 7.4 parser on `setup.ps1` | no findings / parses |
 | Windows: actual run | **not tested** (no Windows machine available) |
 
 ## 11. Known limitations

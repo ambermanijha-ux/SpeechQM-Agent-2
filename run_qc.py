@@ -45,6 +45,18 @@ def step(msg):
     print(f"\n=== {msg}", flush=True)
 
 
+def online() -> bool:
+    """Hugging Face reachable? Offline runs use the models downloaded by an earlier run."""
+    if os.environ.get("HF_HUB_OFFLINE", "0") not in ("0", "", "false", "False"):
+        return False
+    import urllib.request
+    try:
+        urllib.request.urlopen("https://huggingface.co/api/models?limit=1", timeout=8)
+        return True
+    except OSError:
+        return False
+
+
 def setup_token(token_arg, ask):
     """Use --token / HF_TOKEN / the saved login, else ask. Returns the user name or None (no token)."""
     from huggingface_hub import get_token, login, whoami
@@ -56,10 +68,12 @@ def setup_token(token_arg, ask):
     if not token:
         print("No Hugging Face token: using the ungated fallback models.")
         return None
+    from huggingface_hub.errors import HfHubHTTPError
     try:
         user = whoami(token=token)["name"]
-    except Exception as e:
-        sys.exit(f"That Hugging Face token was rejected ({type(e).__name__}). Check it and run again.")
+    except HfHubHTTPError as e:
+        sys.exit(f"That Hugging Face token was rejected ({e.response.status_code if e.response is not None else e}). "
+                 "Create a new Read token and run again with --token hf_...")
     if token != get_token():
         login(token=token, add_to_git_credential=False)   # saved for the next runs
     os.environ["HF_TOKEN"] = token
@@ -151,8 +165,16 @@ def main():
     languages = [lang.title() for lang in runs]
 
     step("2/5 Hugging Face access")
-    user = None if args.no_token else setup_token(args.token, ask)
-    backend = check_gated(languages, ask) if user else "local"
+    if online():
+        user = None if args.no_token else setup_token(args.token, ask)
+        backend = check_gated(languages, ask) if user else "local"
+    else:
+        # huggingface_hub reads this when first imported (download_models / utility_functions, below)
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        from config import PYANNOTE_REPOS
+        from download_models import has_access
+        backend = "pyannote" if not args.no_token and all(has_access(r) for r in PYANNOTE_REPOS) else "local"
+        print(f"Offline: using the models downloaded by an earlier run (speech backend: {backend})")
     import config
     os.environ["SPEECH_BACKEND"] = config.SPEECH_BACKEND = backend   # config is already imported: set both
 
@@ -191,7 +213,7 @@ def main():
 
     import summarize
     path = summarize.write_summary(out, runs)
-    print(f"\nPer-check CSVs: {out}/<language>/results/\nSummary (one row per file): {path}")
+    print(f"\nPer-check CSVs: {out / '<language>' / 'results'}\nSummary (one row per file): {path}")
     if failed:
         sys.exit(f"Failed languages: {', '.join(failed)}")
 

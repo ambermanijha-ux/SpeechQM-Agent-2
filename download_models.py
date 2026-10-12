@@ -3,13 +3,15 @@
 For each language the first ASR candidate in config.ASR_MODELS the Hugging Face token can download is used
 (a gated ai4bharat model whose terms were not accepted falls back to the Vakyansh model).
 """
-import io
 import json
+import shutil
+import tempfile
 import sys
 import urllib.request
 import zipfile
+from pathlib import Path
 
-from huggingface_hub import auth_check, snapshot_download
+from huggingface_hub import auth_check, constants, snapshot_download
 from huggingface_hub.errors import HfHubHTTPError
 
 from config import (ASR_MODELS, ALIGN_MODEL, INDICBERT_TOKENIZER, INDICLID_DIR, OLLAMA_BASE_URL, PLANNER_MODEL,
@@ -22,7 +24,14 @@ HF_WEIGHTS = ["*.json", "*.bin", "*.safetensors", "*.txt", "*.model"]
 
 
 def has_access(repo: str) -> bool:
-    """True if the current Hugging Face token may download the repo (gated repos need their terms accepted)."""
+    """True if the current Hugging Face token may download the repo (gated repos need their terms accepted).
+    Offline (HF_HUB_OFFLINE=1): True if the repo is already in the local cache."""
+    if constants.HF_HUB_OFFLINE:
+        try:
+            snapshot_download(repo, local_files_only=True)
+            return True
+        except Exception:
+            return False
     try:
         auth_check(repo)
         return True
@@ -74,7 +83,7 @@ def ensure_hf(languages, speech_backend="pyannote"):
         repos.append(repo)
     for repo in dict.fromkeys(repos):
         print(f"hf: {repo}")
-        snapshot_download(repo, allow_patterns=HF_WEIGHTS)
+        snapshot_download(repo, allow_patterns=HF_WEIGHTS)   # offline: resolves from the cache
     print(f"hf: {INDICBERT_TOKENIZER} (tokenizer only)")
     snapshot_download(INDICBERT_TOKENIZER, allow_patterns=["*.json", "*.model", "*.txt"])
     # loading once downloads everything the VAD/diarization models pull in (embedding model, PLDA, ECAPA)
@@ -85,14 +94,26 @@ def ensure_hf(languages, speech_backend="pyannote"):
 
 
 def ensure_indiclid():
-    """AI4Bharat IndicLID (GitHub release, not on Hugging Face), ~1.5 GB."""
+    """AI4Bharat IndicLID (GitHub release, not on Hugging Face), ~1.5 GB. Downloaded and extracted into a temporary
+    folder first, so an interrupted download never leaves a half-written model behind."""
     INDICLID_DIR.mkdir(parents=True, exist_ok=True)
     for name, f in INDICLID.items():
         if (INDICLID_DIR / name / f).exists():
             continue
-        print(f"indiclid: downloading {name} (one-time) ...")
-        data = urllib.request.urlopen(INDICLID_URL + name + ".zip").read()
-        zipfile.ZipFile(io.BytesIO(data)).extractall(INDICLID_DIR)
+        with tempfile.TemporaryDirectory(dir=INDICLID_DIR) as tmp:
+            zip_path = Path(tmp) / f"{name}.zip"
+            with urllib.request.urlopen(INDICLID_URL + name + ".zip") as r, open(zip_path, "wb") as out:
+                total, done = int(r.headers.get("Content-Length") or 0), 0
+                while chunk := r.read(1 << 20):
+                    out.write(chunk)
+                    done += len(chunk)
+                    pct = f" {100 * done // total}%" if total else ""
+                    print(f"\r  indiclid: downloading {name}{pct} ({done >> 20} MB)", end="", flush=True)
+            print()
+            zipfile.ZipFile(zip_path).extractall(tmp)
+            if (INDICLID_DIR / name).exists():
+                shutil.rmtree(INDICLID_DIR / name)
+            shutil.move(str(Path(tmp) / name), str(INDICLID_DIR / name))
 
 
 if __name__ == "__main__":
