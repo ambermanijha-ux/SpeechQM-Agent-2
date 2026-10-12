@@ -3,17 +3,19 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 from typing import Dict, Optional, TypedDict
 from concurrent.futures import ThreadPoolExecutor  
 import ast
-from my_secrets import GPT_API_KEY, PROMPT, GROQ_KEY
-from langchain.chains import LLMChain
-from langchain_community.chat_models import ChatOllama
-from langchain_community.chat_models import ChatOpenAI
-from langchain.agents import initialize_agent, AgentType
-from langchain.tools import Tool
-from langchain_experimental.utilities import PythonREPL
+import contextlib
+import io
+import traceback
+try:
+    from my_secrets import PROMPT
+except ImportError:   # run_qc.py passes the prompt and folder directly
+    PROMPT = None
+from langchain_ollama import ChatOllama
 from langgraph.graph import StateGraph, END
 from utility_functions import (
     transcribe_folder_to_csv,
@@ -25,21 +27,121 @@ from utility_functions import (
     check_upsampling_folder,
     language_identification_indiclid,
     transliterate_file,
+    align_model_for,
     get_required_inputs
 )
 import pandas as pd
+from config import OLLAMA_BASE_URL, PLANNER_MODEL, CODER_MODEL, LLM_NUM_CTX, LANG_CODES, DEFAULT_LANGUAGE, SCRIPTS
 logging.basicConfig(filename="pipeline.log", level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-llm = ChatOpenAI(
-    model_name="gpt-4.1-mini",
-    openai_api_key= GPT_API_KEY,
-)
-# from langchain_groq import ChatGroq
-# llm = ChatGroq(
-#     model="llama-3.1-8b-instant", 
-#     api_key= GROQ_KEY,
-#     temperature=0.1,            
-#     max_tokens=4096              
-# )
+# Local LLMs through Ollama (originally gpt-4.1-mini via the OpenAI API)
+def local_llm(model):
+    # thinking models (qwen3, deepseek-r1) would put reasoning text, full of numbers, into the answers we parse
+    thinking = {"reasoning": False} if any(k in model for k in ("qwen3", "deepseek-r1")) else {}
+    return ChatOllama(model=model, base_url=OLLAMA_BASE_URL, temperature=0, num_ctx=LLM_NUM_CTX, **thinking)
+
+
+llm = local_llm(PLANNER_MODEL)
+coder_llm = local_llm(CODER_MODEL)
+
+
+def results_dir(audio_dir: str) -> str:
+    d = os.path.join(os.path.dirname(audio_dir.rstrip("/\\")), "results")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+CODER_SYSTEM = ("You write complete, self-contained Python 3 scripts. Reply with exactly one ```python code block "
+                "containing the whole script; it will be executed for you and you will see its output or error. "
+                "Available libraries: os, csv, json, re, pandas, numpy, soundfile, librosa.")
+
+
+def extract_code(text: str) -> str:
+    m = re.findall(r"```(?:python|py)?\s*\n(.*?)```", text, re.DOTALL)
+    if m:
+        return max(m, key=len)
+    try:   # some models answer with a JSON tool call instead of a code block
+        obj = json.loads(text.strip().strip("`").removeprefix("json"))
+        return obj.get("arguments", obj.get("args", {})).get("code", "")
+    except Exception:
+        return clean_code(text)
+
+
+def run_code(code: str) -> str:
+    """Execute a generated script in a fresh namespace; returns its stdout plus a short traceback.
+    Catches SystemExit so a script calling exit() cannot end the pipeline."""
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            exec(compile(code, "<generated>", "exec"), {"__name__": "__main__"})
+    except SystemExit:
+        pass
+    except Exception:
+        buf.write("\nError:\n" + traceback.format_exc(limit=-3))
+    return buf.getvalue()
+
+
+def describe_inputs(task_prompt: str, output_path: str) -> str:
+    """Show the model the real columns of the CSVs it is asked to read, so it does not guess them."""
+    notes = []
+    for path in dict.fromkeys(re.findall(r"(/[^\s'\"]+\.csv)", task_prompt)):
+        if path != output_path and os.path.isfile(path):
+            try:
+                df = pd.read_csv(path, nrows=1)
+                row = {k: str(v)[:80] for k, v in df.iloc[0].to_dict().items()} if len(df) else {}
+                notes.append(f"- {path} has columns {list(df.columns)}; first row: {row}")
+            except Exception:
+                pass
+    return ("\n    Input files (exact column names):\n    " + "\n    ".join(notes)) if notes else ""
+
+
+AUDIO_EXT = (".wav", ".mp3", ".flac")
+
+
+def list_files(folder: str, ext=None) -> list:
+    return [f for f in os.listdir(folder) if os.path.isfile(os.path.join(folder, f))
+            and not f.startswith(".") and (ext is None or f.lower().endswith(ext))]
+
+
+def csv_rows(path: str, skip_error: bool = False) -> Optional[int]:
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        return None
+    if skip_error:   # num_speakers.csv rows whose diarization failed
+        df = df[df.iloc[:, 1].astype(str) != "Error"]
+    return len(df)
+
+
+def run_agent(task_prompt: str, output_path: str, expected_rows: Optional[int] = None, attempts: int = 3) -> bool:
+    """Code-generating agent: the LLM writes a script for the task, we execute it, and on an error or a
+    missing/empty output CSV the error goes back to the LLM for a corrected script."""
+    if os.path.exists(output_path):
+        os.remove(output_path)
+    prompt = task_prompt + describe_inputs(task_prompt, output_path)
+    if os.sep == "\\":   # Windows: C:\Users\... pasted into a Python string literal is a syntax error ("\U")
+        prompt = prompt.replace("\\", "/")
+    messages = [("system", CODER_SYSTEM), ("user", prompt)]
+    with AGENT_LOCK:
+        for attempt in range(1, attempts + 1):
+            reply = coder_llm.invoke(messages).content
+            code = extract_code(reply)
+            result = run_code(code) if code.strip() else "No code found in the reply."
+            logging.info(f"agent attempt {attempt} for {os.path.basename(output_path)}:\n{code}\n--- output:\n{result[:2000]}")
+            rows = csv_rows(output_path)   # None: missing, empty or unreadable
+            if rows and (expected_rows is None or rows == expected_rows):
+                return True
+            if "\nError:\n" in result:
+                problem = "The script failed."
+            elif rows and expected_rows is not None:
+                problem = f"The output CSV has {rows} rows but must have exactly {expected_rows} (one per input file/row)."
+            else:
+                problem = f"The output file {output_path} was not created or is empty."
+            messages += [("assistant", reply),
+                         ("user", f"Running your script printed:\n{result[:3000]}\n{problem} "
+                                  f"Fix it and reply with the full corrected script.")]
+    return False
+
+
 def parse_prompt(prompt: str) -> Dict[str, Optional[str]]:
     result = {
         "audio_dir": None,
@@ -55,8 +157,14 @@ def parse_prompt(prompt: str) -> Dict[str, Optional[str]]:
     csv_match = re.search(csv_pattern, prompt)
     if csv_match:
         result["ground_truth_csv"] = csv_match.group(1)
+    names = {v.lower(): k for k, v in LANG_CODES.items() if v != "English"}
+    name_match = re.search(r"\b(" + "|".join(names) + r")\b", prompt, re.IGNORECASE)
     lang_match = re.search(lang_pattern, prompt, re.IGNORECASE)
-    if lang_match:
+    if name_match:
+        result["lang_code"] = names[name_match.group(1).lower()]
+    elif re.search(r"\benglish\b(?!\s+words?)", prompt, re.IGNORECASE):
+        result["lang_code"] = "en"
+    elif lang_match:
         result["lang_code"] = lang_match.group(1).lower()
     if not result["audio_dir"] and not result["ground_truth_csv"]:
         llm_prompt = f"""Extract the following from the prompt:
@@ -93,6 +201,16 @@ def parse_prompt(prompt: str) -> Dict[str, Optional[str]]:
         result["ground_truth_csv"] = None
     return result
 
+def words(text: str) -> list:
+    """Words of a transcript without [tags]/<tags> and punctuation; keeps Indic vowel signs (unicode category M)."""
+    import unicodedata
+    text = re.sub(r"\[[^\]]*\]|<[^>]*>", " ", str(text))
+    return "".join(" " if unicodedata.category(ch)[0] in "PSZC" else ch for ch in text).split()
+
+def language_of(state) -> str:
+    """Language named in the prompt (via its code), else DEFAULT_LANGUAGE."""
+    return LANG_CODES.get((state.get('lang_code') or "").lower(), DEFAULT_LANGUAGE)
+
 class CombinedStateDict(TypedDict, total=False):
     audio_dir: str
     ground_truth_csv: str
@@ -119,23 +237,18 @@ class CombinedStateDict(TypedDict, total=False):
     sample_rate_output: str
     english_word_count_output: str
     speaker_duration_output: str
-    utterance_duplicate_checker_output: str
-    wer_computation_agent_output: str
+    utterance_duplicate_output: str
+    wer_output: str
+    transcript_quality_output: str
 
-python_repl = PythonREPL()
-repl_tool = Tool(
-    name="python_repl",
-    description="A Python shell. Use this to execute python commands. Input should be a valid python command. If you want to see the output of a value, you should print it out with `print(...)`.",
-    func=python_repl.run,
-)
-tools = [repl_tool]
-agent = initialize_agent(
-    tools=tools,
-    llm=llm,
-    verbose=True,
-    handle_parsing_errors=True,
-    agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
-)
+AGENT_LOCK = threading.Lock()   # the REPL swaps sys.stdout and Ollama serves one request at a time
+
+
+def clean_code(command: str) -> str:
+    """Small local models often wrap code in fences or prefix every line with 'Action Input:'."""
+    command = re.sub(r"^\s*```(?:python|py)?\s*$", "", command, flags=re.MULTILINE)
+    return re.sub(r"^\s*Action Input:\s?", "", command, flags=re.MULTILINE).strip()
+
 
 def select_tasks(user_prompt: str) -> str:
     prompt_1 = f"""You are given the following functions:
@@ -173,12 +286,16 @@ def select_tasks(user_prompt: str) -> str:
     - If the prompt mentions 'verify' and 'language' or 'expected language', include task 6.
     - If the prompt mentions 'language identification' or 'IndicLID', include tasks 1 and 15 (task 15 requires task 1 to generate transcriptions).
     - Include QC tasks (19, 20, 21) only if explicitly mentioned (e.g., 'corruption', 'extension', 'sample rate')
+    - If the prompt mentions 'silence' or 'VAD', include task 8.
+    - If the prompt mentions 'upsampling' or 'upsampled', include task 11.
+    - If the prompt mentions 'domain', include task 13.
+    - If the prompt mentions 'English words', include task 9. If it mentions 'WER', include task 24.
     - Only include tasks explicitly relevant to the prompt.
-    Return the task numbers as a comma-separated string (e.g., '4,5,6').
+    Return ONLY the task numbers as a comma-separated string (e.g., '4,5,6'), with no other text.
     Prompt: {user_prompt}
     """
     resp_1 = llm.invoke(prompt_1).content
-    task_numbers = re.findall(r'\b\d+\b', resp_1)
+    task_numbers = list(dict.fromkeys(n for n in re.findall(r'\b\d+\b', resp_1) if 1 <= int(n) <= 24))
     expected_tasks = set()
     resp_1 = ','.join(task_numbers) if task_numbers else ''
     logging.info(f"Selected Tasks: {resp_1}")
@@ -221,6 +338,10 @@ def prompt_checker_agent(user_prompt: str, selected_tasks: str) -> str:
     - If the prompt mentions 'language identification' or 'IndicLID', include tasks 1 and 15 (task 15 requires task 1 to generate transcriptions).
     - Include QC tasks (19, 20, 21) only if explicitly mentioned (e.g., 'corruption', 'extension', 'sample rate').
     - If the prompt mentions 'silence' or 'VAD', include task 8.
+    - If the prompt mentions 'upsampling' or 'upsampled', include task 11.
+    - If the prompt mentions 'domain', include task 13.
+    - If the prompt mentions 'new or old' or 'valid speaker', include tasks 2 and 12.
+    - If the prompt mentions 'English words', include task 9. If it mentions 'WER', include task 24. If it mentions 'duplicate', include task 23.
     - If the prompt mentions 'number of speakers' or 'speakers' or 'duration' or 'durations',  include both task 2 and task 22.
     - If the prompt mentions 'ASR' or 'transcription', include task 1.
     - if Task 9 or task 23 or task 24 are included , then definitely include task 16. 
@@ -398,22 +519,26 @@ def corruption_agent(state: CombinedStateDict) -> CombinedStateDict:
     if not audio_dir or not os.path.isdir(audio_dir):
         logging.error(f"Invalid audio directory for corruption check: {audio_dir}")
         return {"corruption_output": "Invalid: No audio directory"}
+    output_path = os.path.join(results_dir(audio_dir), "corruption_check.csv")
     task_prompt = f"""You are given a folder with audios at this path: {audio_dir}.
-    Write a Python script to do the following and then execute it using [python_repl]:
-    - Import the 'os' module.
-    - Create a CSV named 'corruption_check.csv' in the same directory.
+    Write a Python script to do the following:
+    - Import the 'os' and 'soundfile' modules.
+    - Create a CSV at exactly this path: {output_path}
     - The CSV should have columns: Filename, Status.
-    - For each audio file in the folder:
+    - For each file in the folder:
         - Use os.path.getsize(file_path) to get the file size.
-        - If the file size is 0 KB, mark its 'Status' column as 'corrupt'.
-        - If the file size is of .mp3 format, mark its 'Status' column as 'corrupt'.
+        - If the file size is 0 bytes, mark its 'Status' column as 'corrupt'.
+        - If the file is in .mp3 format, mark its 'Status' column as 'corrupt'.
+        - If soundfile.info(file_path) raises an exception, mark its 'Status' column as 'corrupt'.
         - Otherwise, mark its 'Status' column as 'valid'.
-    - Save the CSV.
-    Finally, respond with "Success" if all files are valid, otherwise respond with "Invalid".
+    - Save the CSV and print how many files are corrupt.
     """
     try:
-        response = agent.invoke(task_prompt)
-        return {"corruption_output": response.get("Success", "Invalid")}
+        if not run_agent(task_prompt, output_path, len(list_files(audio_dir))):
+            return {"corruption_output": f"Error: Failed to generate {output_path}"}
+        df = pd.read_csv(output_path)
+        ok = (df["Status"].astype(str).str.lower() == "valid").all()
+        return {"corruption_output": ("Success" if ok else "Invalid") + f" - CSV saved at: {output_path}"}
     except Exception as e:
         logging.error(f"Corruption check failed: {e}")
         return {"corruption_output": f"Error: {e}"}
@@ -423,28 +548,25 @@ def extension_agent(state: CombinedStateDict) -> CombinedStateDict:
     if not audio_dir or not os.path.isdir(audio_dir):
         logging.error(f"Invalid audio directory for extension check: {audio_dir}")
         return {"extension_output": "Invalid: No audio directory"}
+    output_path = os.path.join(results_dir(audio_dir), "audio_format_check.csv")
     task_prompt = f"""You are given a folder with audios at this path: {audio_dir}.
-    Write a Python script to do the following and then execute it using [python_repl]:
+    Write a Python script to do the following:
     - Import the 'os' module and use it to iterate through files in the directory.
 
     Steps:
     1. Check that each file has a valid audio extension (only .wav ).
-    2. Create a CSV named 'audio_format_check.csv' in the same directory.
+    2. Create a CSV at exactly this path: {output_path}
     3. The CSV should have columns: Filename, Valid_Extension.
     4. For each file:
     - 'Valid_Extension' should be True if the filename ends with .wav (case insensitive), else False.
     5. Save the CSV.
-
-    Finally, print "Success" if all files have Valid_Extension=True, otherwise print "Invalid".
     """
-
     try:
-        response = agent.invoke(task_prompt)
-        # Check for the expected output string
-        if "Success" in response:
-            return {"extension_output": "Success"}
-        else:
-            return {"extension_output": "Invalid"}
+        if not run_agent(task_prompt, output_path, len(list_files(audio_dir))):
+            return {"extension_output": f"Error: Failed to generate {output_path}"}
+        df = pd.read_csv(output_path)
+        ok = df["Valid_Extension"].astype(str).str.lower().eq("true").all()
+        return {"extension_output": ("Success" if ok else "Invalid") + f" - CSV saved at: {output_path}"}
     except Exception as e:
         logging.error(f"Extension check failed: {e}")
         return {"extension_output": f"Error: {e}"}
@@ -454,21 +576,20 @@ def sample_rate_agent(state: CombinedStateDict) -> CombinedStateDict:
     if not audio_dir or not os.path.isdir(audio_dir):
         logging.error(f"Invalid audio directory for sample rate check: {audio_dir}")
         return {"sample_rate_output": "Invalid: No audio directory"}
+    output_path = os.path.join(results_dir(audio_dir), "sample_rate_check.csv")
     task_prompt = f"""You are given a folder with audio files at this path: {audio_dir}.
-    Write a Python script to do the following and then execute it using [python_repl]:
-    1. Check each audio file's sample rate
-    2. Create a CSV named sample_rate_check.csv with columns: Filename, Sample_Rate, Status
+    Write a Python script to do the following:
+    1. Check each audio file's sample rate with soundfile.info(path).samplerate
+    2. Create a CSV with columns: Filename, Sample_Rate, Status
     3. Store "Pass" in Status if sample rate is 16000 Hz, otherwise "Fail"
-    4. Save the CSV  in the same directory
-    Use libraries like librosa, soundfile, or wave to check the sample rate.
-    Finally, respond with "Success" if all files have Status "Pass", otherwise respond with "Invalid".
+    4. Save the CSV at exactly this path: {output_path}
     """
     try:
-        response = agent.invoke(task_prompt)
-        if "Success" in response:
-            return {"sample_rate_output": "Success"}
-        else:
-            return {"sample_rate_output": "Invalid"}
+        if not run_agent(task_prompt, output_path, len(list_files(audio_dir, AUDIO_EXT))):
+            return {"sample_rate_output": f"Error: Failed to generate {output_path}"}
+        df = pd.read_csv(output_path)
+        ok = (df["Status"].astype(str) == "Pass").all()
+        return {"sample_rate_output": ("Success" if ok else "Invalid") + f" - CSV saved at: {output_path}"}
     except Exception as e:
         logging.error(f"Sample rate check failed: {e}")
         return {"sample_rate_output": f"Error: {e}"}
@@ -478,8 +599,12 @@ def transcription_func(state: CombinedStateDict) -> CombinedStateDict:
     if not audio_dir or not os.path.isdir(audio_dir):
         logging.error(f"Invalid audio directory for transcription: {audio_dir}")
         return {"A": "Error: Invalid audio directory"}
-    logging.info("Running Transcription")
-    result = transcribe_folder_to_csv(audio_dir, source_language="Hindi")
+    logging.info(f"Running Transcription ({language_of(state)})")
+    try:
+        result = transcribe_folder_to_csv(audio_dir, source_language=language_of(state))
+    except Exception as e:
+        logging.error(f"Transcription failed: {e}")
+        result = f"Error: {e}"
     return {"A": result} #, "audio_dir": audio_dir
 
 def silence_vad_func(state: CombinedStateDict) -> CombinedStateDict:
@@ -502,57 +627,44 @@ def num_speaker_func(state: CombinedStateDict) -> CombinedStateDict:
 
 def vocab_agent(state: CombinedStateDict) -> CombinedStateDict:
     audio_dir = state.get('audio_dir')
-    parent = os.path.dirname(audio_dir.rstrip("/"))
-    csv_path = state.get('A', os.path.join(parent, 'results', "indicconf_hypothesis.csv"))
+    csv_path = state.get('A', os.path.join(results_dir(audio_dir), "indicconf_hypothesis.csv"))
 
     if not csv_path or not os.path.isfile(csv_path):
         logging.error(f"Invalid ground truth CSV for vocab calculation: {csv_path}")
         return {"vocab_output": f"Error: CSV file {csv_path} not found"}
     logging.info("Running vocab_agent")
-    task_prompt = f"""You are given a CSV file at this path: {csv_path}.
-    It has a column called 'Transcription' or 'Ground_Truth',(search case insensitively).
-    Write a Python script to do the following and execute it using [python_repl] tool:
-    1. For each row, extract a list of unique words (vocabulary) from the transcription and store it in a new column called 'vocab_list'.
-    2. Save the updated CSV with the new column to the same directory as vocab_list.csv
-    Respond with "Success" if the script completes
-    """
+    output_path = os.path.join(os.path.dirname(csv_path), "vocab_list.csv")
+    # deterministic: model-written scripts split Indic words at vowel signs (not \w / isalpha in Python)
     try:
-        response = agent.invoke(task_prompt)
-        output_path = os.path.join(os.path.dirname(csv_path), "vocab_list.csv")
-        if response.get("output", "").strip() == "Success" and os.path.exists(output_path):
-            return {"vocab_output": f"CSV saved at: {output_path}"}
-        else:
-            error_msg = f"Failed to generate {output_path}"
-            logging.error(error_msg)
-            return {"vocab_output": error_msg}
+        df = pd.read_csv(csv_path)
+        col = next(c for c in df.columns if c.lower() in ("transcription", "ground_truth", "indiconformer_hypothesis"))
+        df['vocab_list'] = df[col].fillna("").astype(str).apply(lambda t: json.dumps(list(dict.fromkeys(words(t))), ensure_ascii=False))
+        df.to_csv(output_path, index=False)
+        return {"vocab_output": f"CSV saved at: {output_path}"}
     except Exception as e:
-        logging.error(f"Vocab calculation failed: {e}")
+        logging.error(f"Vocab extraction failed: {e}")
         return {"vocab_output": f"Error: {e}"}
 
 def character_agent(state: CombinedStateDict) -> CombinedStateDict:
     audio_dir = state.get('audio_dir')
-    parent = os.path.dirname(audio_dir.rstrip("/"))
-    csv_path = state.get('A', os.path.join(parent, 'results' ,"indicconf_hypothesis.csv"))
+    csv_path = state.get('A', os.path.join(results_dir(audio_dir), "indicconf_hypothesis.csv"))
     if not csv_path or not os.path.isfile(csv_path):
         logging.error(f"Invalid ground truth CSV for character calculation: {csv_path}")
         return {"character_output": f"Error: CSV file {csv_path} not found"}
     logging.info("Running character_agent")
+    output_path = os.path.join(os.path.dirname(csv_path), "character_list.csv")
     task_prompt = f"""You are given a CSV file at this path: {csv_path}.
-    It has a column called 'Transcription' or 'Ground_Truth',(search case insensitively), take it as transcription coloumn.
-    Write a Python script to do the following and execute it using [python_repl] tool:
-    1. For each row, extract a list of unique characters from the transcription coloumn and store it in a new column called 'character_list'.
-    2. Save the updated CSV with the new column to the same directory as character_list.csv
-    Respond with "Success" if the script completes
+    It has a transcription column called 'Transcription', 'Ground_Truth' or 'Indiconformer_Hypothesis' (search case insensitively).
+    Write a Python script to do the following:
+    1. For each row, extract a list of unique characters from the transcription column and store it in a new column called 'character_list'.
+    2. Save the updated CSV with the new column at exactly this path: {output_path}
     """
     try:
-        response = agent.invoke(task_prompt)
-        output_path = os.path.join(os.path.dirname(csv_path), "character_list.csv")
-        if response.get("output", "").strip() == "Success" and os.path.exists(output_path):
+        if run_agent(task_prompt, output_path, csv_rows(csv_path)):
             return {"character_output": f"CSV saved at: {output_path}"}
-        else:
-            error_msg = f"Failed to generate {output_path}"
-            logging.error(error_msg)
-            return {"character_output": error_msg}
+        error_msg = f"Failed to generate {output_path}"
+        logging.error(error_msg)
+        return {"character_output": error_msg}
     except Exception as e:
         logging.error(f"Character calculation failed: {e}")
         return {"character_output": f"Error: {e}"}
@@ -563,65 +675,55 @@ def audio_length_agent(state: CombinedStateDict) -> CombinedStateDict:
         logging.error(f"Invalid audio directory for audio length calculation: {audio_dir}")
         return {"audio_length_output": "Error: Invalid audio directory"}
     logging.info("Running audio_length_agent")
+    output_path = os.path.join(results_dir(audio_dir), "audio_length.csv")
     task_prompt = f"""You are given audio files in the folder: {audio_dir}.
-    Write a Python script to do the following and execute it using [python_repl] tool:
+    Write a Python script to do the following:
     1. Create a CSV with columns Filename and Audio_length.
-    2. For each audio file, calculate its duration in seconds and store it in 'Audio_length' column.
-    3. Save the CSV as audio_length.csv in the same folder.
+    2. For each audio file (.wav, .mp3, .flac), calculate its duration in seconds (use soundfile.info(path).duration) and store it in 'Audio_length' column.
+    3. Save the CSV at exactly this path: {output_path}
     """
     try:
-        response = agent.invoke(task_prompt)
-        return {"audio_length_output": response.get("output", "Invalid")}
+        if run_agent(task_prompt, output_path, len(list_files(audio_dir, AUDIO_EXT))):
+            return {"audio_length_output": f"CSV saved at: {output_path}"}
+        return {"audio_length_output": f"Error: Failed to generate {output_path}"}
     except Exception as e:
         logging.error(f"Audio length calculation failed: {e}")
         return {"audio_length_output": f"Error: {e}"}
 
 def language_verification_agent(state: CombinedStateDict) -> CombinedStateDict:
     audio_dir = state.get('audio_dir')
-    parent = os.path.dirname(audio_dir.rstrip("/"))
-    csv_path = state.get('A', os.path.join(parent, 'results', "indicconf_hypothesis.csv"))
+    csv_path = state.get('A', os.path.join(results_dir(audio_dir), "indicconf_hypothesis.csv"))
     if not csv_path or not os.path.isfile(csv_path):
         logging.error(f"Invalid ground truth CSV for language verification: {csv_path}")
         return {"language_verification_output": f"Error: CSV file {csv_path} not found"}
-    logging.info(f"Running Devanagari script verification with CSV: {csv_path}")
-    task_prompt = f"""You are a script recognition expert.
-    Your task is to determine whether the text in the 'ground_truth' column of a CSV file is written in the Devanagari script.
-    Please follow these steps:
-    Unicode Range for Devanagari Script:
-    The Unicode range for the Devanagari script is from U+0900 to U+097F.
-    This includes characters used in languages like Hindi, Sanskrit, Marathi, and others that use Devanagari as their writing system.
-    use python and follow the Steps:
-    1. Load the CSV file at this path: {csv_path} after import necessary python modules.
-    2. Identify the 'ground_truth' column (case-insensitive, e.g., 'Ground_Truth', 'transcription').
-    3. For each row in the 'ground_truth' column, check if all characters (excluding whitespace and punctuation) fall within the Unicode range U+0900 to U+097F.
-    4. Add a new column 'Is_Devanagari' with True if all relevant characters are in the Devanagari range, False otherwise.
-    5. If the transcription is empty or contains only whitespace/punctuation, set 'Is_Devanagari' to False.
-    6. Save the updated CSV as 'language_verification.csv' in the same directory as the input CSV.
-    7. Ensure the output CSV includes columns: 'Filename', 'Transcription' (the ground_truth text), and 'Is_Devanagari'.
-    8. Handle errors gracefully.
-    Example Text:
-    "नमस्ते, आप कैसे हैं?" -> Is_Devanagari: True (all characters are in U+0900 to U+097F)
-    "Hello" -> Is_Devanagari: False (characters are not in U+0900 to U+097F)
-    Use the `python_repl` tool to execute a Python script that performs these steps.
-    Respond with "Success" if the CSV is saved successfully, otherwise return an error message.
-    """
+    script, lo, hi = SCRIPTS.get(language_of(state), SCRIPTS["Hindi"])
+    col = f"Is_{script}"
+    logging.info(f"Running {script} script verification with CSV: {csv_path}")
+    output_path = os.path.join(os.path.dirname(csv_path), "language_verification.csv")
     try:
-        response = agent.invoke(task_prompt)
-        output_path = os.path.join(os.path.dirname(csv_path), "language_verification.csv")
-        if response.get("output", "").strip() == "Success" and os.path.exists(output_path):
-            logging.info(f"Devanagari verification CSV saved to: {output_path}")
-            return {"language_verification_output": f"CSV saved at: {output_path}"}
-        else:
-            logging.error(f"Devanagari verification failed to generate {output_path}: {response.get('output', 'No output')}")
-            return {"language_verification_output": f"Error: Failed to generate {output_path}"}
+        df = pd.read_csv(csv_path)
+        fcol = next(c for c in df.columns if c.lower() == "filename")
+        tcol = next(c for c in df.columns if c.lower() in ("ground_truth", "transcription", "indiconformer_hypothesis"))
+        texts = df[tcol].fillna("").astype(str)
+        def share(t):   # share of letters (tags removed) inside the script's Unicode block
+            letters = [ch for w in words(t) for ch in w if not ch.isdigit()]
+            return sum(lo <= ord(ch) <= hi for ch in letters) / len(letters) if letters else 0.0
+        out = pd.DataFrame({"Filename": df[fcol], "Transcription": texts, f"{script}_Share": texts.apply(share).round(3)})
+        out[col] = texts.apply(lambda t: bool(words(t)) and share(t) == 1.0)
+        out.to_csv(output_path, index=False)
+        logging.info(f"{script} verification CSV saved to: {output_path}")
+        return {"language_verification_output": f"CSV saved at: {output_path}"}
     except Exception as e:
-        logging.error(f"Devanagari verification failed: {e}")
+        logging.error(f"Script verification failed: {e}")
         return {"language_verification_output": f"Error: {e}"}
 
 def ctc_score_agent(state: CombinedStateDict) -> CombinedStateDict:
     audio_dir = state.get('audio_dir')
-    parent = os.path.dirname(audio_dir.rstrip("/"))
-    csv_path = state.get('A', os.path.join(parent, 'results', "indicconf_hypothesis.csv"))
+    parent = os.path.dirname(audio_dir.rstrip("/\\"))
+    # score the ground truth against the audio when it is available, else the ASR hypothesis
+    gt_csv = os.path.join(parent, 'results', "indicconf_hypothesis-gt.csv")
+    csv_path = (state.get('ground_truth_csv') or (gt_csv if os.path.isfile(gt_csv) else None)
+                or state.get('A', os.path.join(parent, 'results', "indicconf_hypothesis.csv")))
     if not audio_dir or not os.path.isdir(audio_dir):
         logging.error(f"Invalid audio directory for CTC score: {audio_dir}")
         return {"ctc_score_output": "Error: Invalid audio directory"}
@@ -631,7 +733,7 @@ def ctc_score_agent(state: CombinedStateDict) -> CombinedStateDict:
     logging.info("Running CTC score calculation")
     try:
         output_path = os.path.join(os.path.dirname(csv_path), "ctc_scores.csv")
-        results = process_audio_directory(audio_dir, csv_path, output_path)
+        results = process_audio_directory(audio_dir, csv_path, output_path, language=language_of(state))
         if results:
             df = pd.DataFrame(results)
             if df.empty:
@@ -664,22 +766,18 @@ def ctc_score_agent(state: CombinedStateDict) -> CombinedStateDict:
 
 def transcript_quality_agent(state: CombinedStateDict) -> CombinedStateDict:
     audio_dir = state.get('audio_dir')
-    csv_path = state.get('A', os.path.join(audio_dir, "indicconf_hypothesis.csv"))
+    csv_path = state.get('A', os.path.join(results_dir(audio_dir), "indicconf_hypothesis.csv"))
     if not csv_path or not os.path.isfile(csv_path):
         logging.error(f"Invalid ground truth CSV for transcript quality: {csv_path}")
         return {"transcript_quality_output": f"Error: CSV file {csv_path} not found"}
     logging.info("Running transcript quality check")
-    task_prompt = f"""You are given a CSV file at this path: {csv_path} containing transcriptions.
-    Write a Python script to check the quality of each transcript using the transcript_quality function from utility_functions.
-    Your script should:
-    1. Load the CSV file
-    2. Apply the transcript_quality function to each transcript
-    3. Store the result in a new column called 'Quality_Check'
-    4. Save the updated CSV with the new column to the same directory as transcript_quality.csv
-    """
     try:
-        response = agent.invoke(task_prompt)
-        return {"transcript_quality_output": response.get("output", "Invalid")}
+        df = pd.read_csv(csv_path)
+        col = next(c for c in df.columns if c.lower() in ("ground_truth", "transcription", "indiconformer_hypothesis"))
+        df['Quality_Check'] = df[col].fillna("").astype(str).apply(transcript_quality)
+        output_path = os.path.join(os.path.dirname(csv_path), "transcript_quality.csv")
+        df.to_csv(output_path, index=False)
+        return {"transcript_quality_output": f"CSV saved at: {output_path}"}
     except Exception as e:
         logging.error(f"Transcript quality check failed: {e}")
         return {"transcript_quality_output": f"Error: {e}"}
@@ -699,32 +797,28 @@ def valid_speaker_agent(state: CombinedStateDict) -> CombinedStateDict:
         logging.error(f"Invalid audio directory for valid speaker check: {audio_dir}")
         return {"valid_speaker_output": "Error: Invalid audio directory"}
     logging.info("Running valid speaker check")
-    parent = os.path.dirname(audio_dir.rstrip("/"))
-    task_prompt = f"""You are given a folder at this path: {audio_dir} containing a CSV file named 'num_speakers.csv'. 
+    res = results_dir(audio_dir)
+    input_path = os.path.join(res, "num_speakers.csv")
+    output_path = os.path.join(res, "valid_speaker.csv")
+    task_prompt = f"""You are given a CSV file at this path: {input_path}.
     The CSV has columns 'File Name', 'Number of Speakers', and 'Speaker Durations', where 'Speaker Durations' is a JSON string mapping speaker IDs to their speaking durations in hours.
+    Speaker IDs are global: the same ID in two files means the same voice.
     Write a Python script to:
-    1. Load the 'num_speakers.csv' file.
-    2. Create a dictionary to count how many files each speaker appears in.
+    1. Load the CSV file.
+    2. Create a dictionary to count how many files each speaker ID appears in.
     3. For each file in the CSV:
-    - Parse the 'Number of Speakers' and 'Speaker Durations' columns.
-    - If 'Number of Speakers' is 1 and 'SPEAKER_00' appears in more than one file, set Speaker_Status to 'Old' and Common_File to the current file name.
-    - If 'Number of Speakers' > 1 and any speaker appears in more than one file, set Speaker_Status to 'Old' and Common_File to the current file name.
-    - If 'Number of Speakers' = 'Error' , skip that row.
+    - If 'Number of Speakers' is 'Error', skip that row.
+    - If any of the file's speaker IDs appears in more than one file, set Speaker_Status to 'Old' and Common_File to a ';'-joined list of the OTHER files containing that speaker.
     - Otherwise, set Speaker_Status to 'New' and Common_File to an empty string.
-    4. Create a new CSV with columns: 'Filename', 'Speaker_Status', 'Common_File'.
-    5. Save the CSV as 'valid_speaker.csv' in the same directory.
+    4. Create a new CSV with columns: 'Filename', 'Speaker_Status', 'Common_File', with one row for EVERY file (New and Old).
+    5. Save the CSV at exactly this path: {output_path}
     6. Handle errors gracefully.
-    Respond with "Success" if the script completes and the CSV is saved, otherwise "Invalid".
     """
     try:
-        response = agent.invoke(task_prompt)
-        output_path = os.path.join(parent, 'results', "valid_speaker.csv")
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        if response.get("output", "").strip() == "Success" and os.path.exists(output_path):
+        if run_agent(task_prompt, output_path, csv_rows(input_path, skip_error=True)):
             return {"valid_speaker_output": f"CSV saved at: {output_path}"}
-        else:
-            logging.error(f"Valid speaker check failed to generate {output_path}")
-            return {"valid_speaker_output": f"Error: Failed to generate {output_path}"}
+        logging.error(f"Valid speaker check failed to generate {output_path}")
+        return {"valid_speaker_output": f"Error: Failed to generate {output_path}"}
     except Exception as e:
         logging.error(f"Valid speaker check failed: {e}")
         return {"valid_speaker_output": f"Error: {e}"}
@@ -734,7 +828,7 @@ def domain_checker_agent(state: CombinedStateDict) -> CombinedStateDict:
     if not audio_dir or not os.path.isdir(audio_dir):
         logging.error(f"Invalid audio directory for domain checker: {audio_dir}")
         return {"domain_checker_output": "Error: Invalid audio directory"}
-    parent = os.path.dirname(audio_dir.rstrip("/"))
+    parent = os.path.dirname(audio_dir.rstrip("/\\"))
     csv_path = os.path.join(parent, 'results' ,"indicconf_hypothesis.csv")
     if not os.path.exists(csv_path):
         logging.error(f"CSV file not found: {csv_path}")
@@ -745,10 +839,10 @@ def domain_checker_agent(state: CombinedStateDict) -> CombinedStateDict:
             logging.error("Column 'Indiconformer_Hypothesis' not found in CSV.")
             return {"domain_checker_output": "Error: 'Indiconformer_Hypothesis' column missing."}
         original_domains = ['Conversation', 'Keywords Spotting', 'Product Review','GK Questions', 'District Specific', 'KYP - Games',
-       'Task of Fives', 'DOI - Religion', 'KYP - Cooking', 'Daily Life']
+       'Task of Fives', 'DOI - Religion', 'KYP - Cooking', 'Daily Life', 'Healthcare', 'Insurance', 'Finance', 'Sales']
         domains = []
         for i, transcript in enumerate(df['Indiconformer_Hypothesis']):
-            prompt = f"""You are a Hindi language expert. Analyze the following normalized Hindi transcript and determine the general domain of the speech dataset. some original domains to choose from are {original_domains}.
+            prompt = f"""You are a {language_of(state)} language expert. Analyze the following normalized {language_of(state)} transcript and determine the general domain of the speech dataset. some original domains to choose from are {original_domains}.
             ## OUTPUT FORMAT: Return the domain from original domains as a one word phrase suitable from original domains. no additional terms
             Now classify this transcript:
             Transcript: {transcript}
@@ -756,7 +850,7 @@ def domain_checker_agent(state: CombinedStateDict) -> CombinedStateDict:
     """
             try:
                 response = llm.invoke(prompt)
-                domains.append(response.content.strip())
+                domains.append(re.sub(r"^\W*domain\W*", "", response.content.strip(), flags=re.IGNORECASE))
 
             except Exception as e:
                 logging.warning(f"LLM failed on row {i}: {e}")
@@ -776,8 +870,7 @@ def domain_checker_agent(state: CombinedStateDict) -> CombinedStateDict:
 
 def audio_transcript_matching_agent(state: CombinedStateDict) -> CombinedStateDict:
     audio_dir = state.get('audio_dir')
-    parent = os.path.dirname(audio_dir.rstrip("/"))
-    csv_path = state.get('A', os.path.join(parent, 'results', "indicconf_hypothesis.csv"))
+    csv_path = state.get('A', os.path.join(results_dir(audio_dir), "indicconf_hypothesis.csv"))
     if not audio_dir or not os.path.isdir(audio_dir):
         logging.error(f"Invalid audio directory for transcript matching: {audio_dir}")
         return {"audio_transcript_matching_output": "Error: Invalid audio directory"}
@@ -785,28 +878,26 @@ def audio_transcript_matching_agent(state: CombinedStateDict) -> CombinedStateDi
         logging.error(f"Invalid ground truth CSV for transcript matching: {csv_path}")
         return {"audio_transcript_matching_output": f"Error: CSV file {csv_path} not found"}
     logging.info("Running audio and transcript matching")
-    task_prompt = f"""You are given a folder at this path: {audio_dir} containing audio files (.wav or .mp3) and a CSV file at {csv_path}. 
-    The CSV has columns 'Filename' and 'Indiconformer_Hypothesis', where 'Indiconformer_Hypothesis' contains ground truth transcriptions.
+    output_path = os.path.join(results_dir(audio_dir), "audio_transcript_matching.csv")
+    task_prompt = f"""You are given a folder at this path: {audio_dir} containing audio files (.wav or .mp3) and a CSV file at {csv_path}.
+    The CSV has columns 'Filename' and 'Indiconformer_Hypothesis', where 'Indiconformer_Hypothesis' contains the transcriptions.
     Write a Python script to:
     1. Load the CSV file.
     2. For each row in the CSV:
     - Get the audio file path by joining the folder path with the 'Filename'.
-    - Use the force_alignment_and_ctc_score function from utility_functions to perform forced alignment.
-    - Create an aligned transcript by joining tokens from aligned_segments, excluding special tokens.
-    3. Create a CSV with columns 'Filename', 'Aligned_Segments' (JSON string), and 'Aligned_Transcript'.
-    4. Save the CSV as 'audio_transcript_matching.csv' in the same directory.
+    - Call `from utility_functions import force_alignment_and_ctc_score` and run
+      `aligned_segments, avg_score = force_alignment_and_ctc_score(audio_path, transcript, "{align_model_for(language_of(state))}")`.
+      Each aligned segment is a list [token, start_time, end_time, score].
+    - Create an aligned transcript by joining the tokens from aligned_segments.
+    3. Create a CSV with columns 'Filename', 'Aligned_Segments' (JSON string), 'Aligned_Transcript' and 'CTC_Score' (avg_score).
+    4. Save the CSV at exactly this path: {output_path}
     5. Handle errors gracefully.
-    Respond with "Success" if the script completes and the CSV is saved, otherwise "Invalid".
     """
     try:
-        response = agent.invoke(task_prompt)
-        output_path = os.path.join(parent,'results', "audio_transcript_matching.csv")
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        if response.get("output", "").strip() == "Success" and os.path.exists(output_path):
+        if run_agent(task_prompt, output_path, csv_rows(csv_path)):
             return {"audio_transcript_matching_output": f"CSV saved at: {output_path}"}
-        else:
-            logging.error(f"Transcript matching failed to generate {output_path}")
-            return {"audio_transcript_matching_output": f"Error: Failed to generate {output_path}"}
+        logging.error(f"Transcript matching failed to generate {output_path}")
+        return {"audio_transcript_matching_output": f"Error: Failed to generate {output_path}"}
     except Exception as e:
         logging.error(f"Transcript matching failed: {e}")
         return {"audio_transcript_matching_output": f"Error: {e}"}
@@ -817,7 +908,7 @@ def language_identification_indiclid_agent(state: CombinedStateDict) -> Combined
     if not audio_dir or not os.path.isdir(audio_dir):
         logging.error("Invalid or missing audio directory")
         return {"language_identification_indiclid_output": "Error: Invalid audio directory"}
-    parent = os.path.dirname(audio_dir.rstrip("/"))
+    parent = os.path.dirname(audio_dir.rstrip("/\\"))
     output_path = os.path.join(parent, 'results', "indiclid_language_identification.csv")
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     if os.path.exists(output_path):
@@ -887,70 +978,73 @@ def language_identification_indiclid_agent(state: CombinedStateDict) -> Combined
 
 def normalization_remove_tags_agent(state: CombinedStateDict) -> CombinedStateDict:
     audio_dir = state.get('audio_dir')
-    parent = os.path.dirname(audio_dir.rstrip("/"))
-    csv_path =  os.path.join(parent, 'results', "indicconf_hypothesis-gt.csv")
-    output_path = os.path.join(parent, 'results', "normalized_list.csv")
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    res = results_dir(audio_dir)
+    csv_path = os.path.join(res, "indicconf_hypothesis-gt.csv")
+    output_path = os.path.join(res, "normalized_list.csv")
     if os.path.exists(output_path):
         return {"normalization_remove_tags_output": f"CSV already exists at: {output_path}"}
-    if not csv_path or not os.path.isfile(csv_path):
-        logging.error(f"Invalid ground truth CSV for character calculation: {csv_path}")
-        return {"normalization_remove_tags_output": f"Error: CSV file {csv_path} not found"}
+    if not os.path.isfile(csv_path):
+        logging.error(f"Ground truth CSV for normalization not found: {csv_path}")
+        return {"normalization_remove_tags_output": f"Error: CSV file {csv_path} not found (needs columns filename, ground_truth)"}
     logging.info("Running normalizing_agent")
-    task_prompt = f"""You are given a folder at this path: {audio_dir} containing a CSV file named 'indicconf_hypothesis.csv'
-    It has a column called 'Transcriptions' or 'ground_truth'(search case insensitively), take it as transcription coloumn.
-    Write a Python script that reads a CSV file containing two columns: filename and ground_truth. The goal is to clean the ground_truth text and save the results to a new column called normalized_transcripts, then write the updated data to a new CSV.
-    Execute the python script to do the following using [python_repl] tool.
+    task_prompt = f"""You are given a CSV file at this path: {csv_path}
+    It contains two columns: filename and ground_truth (search case insensitively).
+    Write a Python script that cleans the ground_truth text, saves it in a new column called normalized_transcripts, then writes the updated data to a new CSV.
     The cleaning steps are:
     -Remove HTML tags like <b> or </b>.
     -Remove any text enclosed in square brackets (e.g., [START]).
     -Remove all symbols like ['#','$','%']
+    -Collapse repeated whitespace.
     -The output CSV should preserve the original columns and include the cleaned transcript in the normalized_transcripts column.
-    -Save the updated CSV with the new column to the same directory as normalized_list.csv
-    Respond with "Success" if the script completes
+    -Save the updated CSV at exactly this path: {output_path}
     """
     try:
-        response = agent.invoke(task_prompt)
-        output_path = os.path.join(os.path.dirname(csv_path), "normalized_list.csv")
-        if response.get("output", "").strip() == "Success" and os.path.exists(output_path):
+        if run_agent(task_prompt, output_path, csv_rows(csv_path)):
             return {"normalization_remove_tags_output": f"CSV saved at: {output_path}"}
-        else:
-            error_msg = f"Failed to generate {output_path}"
-            logging.error(error_msg)
-            return {"normalization_remove_tags_output": error_msg}
+        error_msg = f"Failed to generate {output_path}"
+        logging.error(error_msg)
+        return {"normalization_remove_tags_output": error_msg}
     except Exception as e:
-        logging.error(f"Character calculation failed: {e}")
+        logging.error(f"Normalization failed: {e}")
         return {"normalization_remove_tags_output": f"Error: {e}"}
 
 def llm_score_agent(state: CombinedStateDict) -> CombinedStateDict:
+    """LLM-as-a-judge: the local LLM scores each transcription's coherence and fluency (0-10)."""
     audio_dir = state.get('audio_dir')
-    parent = os.path.dirname(audio_dir.rstrip("/"))
     if not audio_dir or not os.path.isdir(audio_dir):
         logging.error(f"Invalid audio directory for LLM score: {audio_dir}")
         return {"llm_score_output": "Error: Invalid audio directory"}
     logging.info("Running LLM score evaluation")
-    task_prompt = f"""You are given a folder at this path: {audio_dir} containing a CSV file named 'indicconf_hypothesis.csv'. 
-    The CSV has columns 'Filename'(search case insensitively) which contains filenames and either 'ground_truth' or 'transcriptions' coloumn (only one of 'ground_truth' or 'transcriptions' coloumn will be there) ,(search case insensitively), and that coloumn contains ASR transcription.
-    Write a Python script to do the following and execute it using [pythom_repl] :
-    1. Load the 'indicconf_hypothesis.csv' file.
-    2. For each transcription(analyse each line carefully and dont just assign a single score to every row, assign scores only after understanding the fluency of the senetnce and its meaning):
-    - Evaluate its coherence and fluency very strictly using the LLM as a judge.
-    - Assign a score from 0 to 10(where 10 is given for meaningful sentences , and decrease the scores for as meaningless as they get and if any other language is detected other than one expected mark it 0).
-    - Provide a brief comment explaining the score(We are evaluating the accuracy of hindi so be the judge and very strictly comment on the transcriptions)
-    3. Create a CSV with columns 'Filename', 'Transcription', 'LLM_Score', and 'Evaluation_Comment'.
-    4. Save the CSV as 'llm_scores.csv' in the same directory.
-    5. Handle errors gracefully.
-    Respond with "Success" if the script completes and the CSV is saved, otherwise "Invalid".
-    """
+    res = results_dir(audio_dir)
+    csv_path = state.get('A', os.path.join(res, "indicconf_hypothesis.csv"))
+    if not os.path.isfile(csv_path):
+        return {"llm_score_output": f"Error: CSV file {csv_path} not found"}
     try:
-        response = agent.invoke(task_prompt)
-        output_path = os.path.join(parent, 'results', "llm_scores.csv")
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        if response.get("output", "").strip() == "Success" and os.path.exists(output_path):
-            return {"llm_score_output": f"CSV saved at: {output_path}"}
-        else:
-            logging.error(f"LLM score evaluation failed to generate {output_path}")
-            return {"llm_score_output": f"Error: Failed to generate {output_path}"}
+        df = pd.read_csv(csv_path)
+        fcol = next(c for c in df.columns if c.lower() == "filename")
+        tcol = next(c for c in df.columns if c.lower() in ("ground_truth", "transcriptions", "transcription", "indiconformer_hypothesis"))
+        rows = []
+        for fname, text in zip(df[fcol], df[tcol].fillna("").astype(str)):
+            prompt = f"""You are a strict judge of {language_of(state)} speech transcriptions.
+    Evaluate the coherence and fluency of this transcription. Understand the meaning before scoring; do not give every transcription the same score.
+    Score from 0 to 10: 10 for fluent, meaningful sentences, lower the more meaningless it gets, and 0 if it is in a language other than {language_of(state)}.
+    Reply in exactly this format:
+    Score: <0-10>
+    Comment: <one sentence>
+    Transcription: {text[:4000]}"""
+            try:
+                out = llm.invoke(prompt).content
+                m = re.search(r'Score:\s*(\d+(?:\.\d+)?)', out)
+                c = re.search(r'Comment:\s*(.*)', out, re.DOTALL)
+                score = min(10.0, float(m.group(1))) if m else None
+                comment = c.group(1).strip() if c else out.strip()
+            except Exception as e:
+                logging.warning(f"LLM score failed for {fname}: {e}")
+                score, comment = None, f"Error: {e}"
+            rows.append({"Filename": fname, "Transcription": text, "LLM_Score": score, "Evaluation_Comment": comment})
+        output_path = os.path.join(res, "llm_scores.csv")
+        pd.DataFrame(rows).to_csv(output_path, index=False)
+        return {"llm_score_output": f"CSV saved at: {output_path}"}
     except Exception as e:
         logging.error(f"LLM score evaluation failed: {e}")
         return {"llm_score_output": f"Error: {e}"}
@@ -966,7 +1060,7 @@ def transliteration_agent(state: CombinedStateDict) -> CombinedStateDict:
         return {"transliteration_output": "Error: No language code provided"}
     logging.info("Running transliteration")
     try:
-        result = transliterate_file(csv_path, lang_code)
+        result = transliterate_file(csv_path, lang_code, llm=llm)
         return {"transliteration_output": result}
     except Exception as e:
         logging.error(f"Transliteration failed: {e}")
@@ -976,7 +1070,7 @@ def transliteration_agent(state: CombinedStateDict) -> CombinedStateDict:
 
 def speaker_duration_agent(state: CombinedStateDict) -> CombinedStateDict:
     audio_dir = state.get('audio_dir')
-    parent = os.path.dirname(audio_dir.rstrip("/"))
+    parent = os.path.dirname(audio_dir.rstrip("/\\"))
     if not audio_dir or not os.path.isdir(audio_dir):
         logging.error("Invalid or missing audio directory")
         return {"speaker_duration_output": "Error: Invalid audio directory"}
@@ -1025,7 +1119,7 @@ def speaker_duration_agent(state: CombinedStateDict) -> CombinedStateDict:
 
 def english_word_count_agent(state: CombinedStateDict) -> CombinedStateDict:
     audio_dir = state.get('audio_dir')
-    parent = os.path.dirname(audio_dir.rstrip("/"))
+    parent = os.path.dirname(audio_dir.rstrip("/\\"))
     if not audio_dir or not os.path.isdir(audio_dir):
         logging.error(f"Invalid audio directory for word counter: {audio_dir}")
         return {"english_word_count_output": "Error: Invalid audio directory"}
@@ -1039,21 +1133,10 @@ def english_word_count_agent(state: CombinedStateDict) -> CombinedStateDict:
         if 'ground_truth' not in df.columns:
             logging.error("Column 'ground_truth' not found in CSV.")
             return {"english_word_count_output": "Error: 'ground_truth' column missing."}
-        word_counts = []
-        for i, text in enumerate(df['ground_truth']):
-            prompt = f"""You are a language expert. Count and return only the number of **English words** (case-insensitive) in the following text.
-    Text:
-    {text}
-    Respond with just the number."""
-            try:
-                response = llm.invoke(prompt)
-                count_str = response.content.strip()
-                count = int(count_str)
-                word_counts.append(count)
-            except Exception as e:
-                logging.warning(f"LLM failed on row {i}: {e}")
-                word_counts.append(-1)
-
+        # deterministic: English in these transcripts is written in Latin script, so count Latin-script words
+        # ([tags] excluded); the LLM's counts were off by 2x and more on long transcripts
+        word_counts = [sum(1 for w in words(t) if re.fullmatch(r"[A-Za-z][A-Za-z'.-]*", w))
+                       for t in df['ground_truth'].fillna("").astype(str)]
         df['english_word_count'] = word_counts
         output_path = os.path.join(parent, 'results', "english_word_count.csv")
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
@@ -1068,7 +1151,7 @@ def english_word_count_agent(state: CombinedStateDict) -> CombinedStateDict:
 
 def utterance_duplicate_checker_agent(state: CombinedStateDict) -> CombinedStateDict:
     audio_dir = state.get('audio_dir')
-    parent = os.path.dirname(audio_dir.rstrip("/"))
+    parent = os.path.dirname(audio_dir.rstrip("/\\"))
     if not audio_dir or not os.path.isdir(audio_dir):
         logging.error(f"Invalid audio directory for duplicate checker: {audio_dir}")
         return {"utterance_duplicate_output": "Error: Invalid audio directory"}
@@ -1106,7 +1189,7 @@ def utterance_duplicate_checker_agent(state: CombinedStateDict) -> CombinedState
 import jiwer
 def wer_computation_agent(state: CombinedStateDict) -> CombinedStateDict:
     audio_dir = state.get("audio_dir")
-    parent = os.path.dirname(audio_dir.rstrip("/"))
+    parent = os.path.dirname(audio_dir.rstrip("/\\"))
     if not audio_dir or not os.path.isdir(audio_dir):
         logging.error(f"Invalid audio directory for WER computation: {audio_dir}")
         return {"wer_output": "Error: Invalid audio directory"}
@@ -1117,26 +1200,22 @@ def wer_computation_agent(state: CombinedStateDict) -> CombinedStateDict:
             return {"wer_output": "Error: One or both CSV files not found"}
         ref_df = pd.read_csv(ref_csv_path)
         hyp_df = pd.read_csv(hyp_csv_path)
-        if len(ref_df) != len(hyp_df):
-            return {"wer_output": "Error: CSVs do not have the same number of rows"}
-        references = ref_df["normalized_transcripts"].astype(str)
-        hypotheses = hyp_df["Indiconformer_Hypothesis"].astype(str)
+        # pair by filename (only some files may have a reference); compare words without punctuation/tags
+        refs = dict(zip(ref_df[next(c for c in ref_df.columns if c.lower() == "filename")].astype(str),
+                        ref_df["normalized_transcripts"].fillna("").astype(str)))
         wer_rows = []
-        for ref, hyp in zip(references, hypotheses):
+        for fname, hyp in zip(hyp_df["Filename"].astype(str), hyp_df["Indiconformer_Hypothesis"].fillna("").astype(str)):
+            if fname not in refs:
+                continue
+            ref, hyp = " ".join(words(refs[fname])), " ".join(words(hyp))
             try:
-                error = jiwer.wer(ref, hyp)
-                wer_rows.append({
-                    "Reference": ref,
-                    "Hypothesis": hyp,
-                    "WER": round(error, 4)
-                })
+                error = round(jiwer.wer(ref, hyp), 4) if ref else "No reference"
             except Exception as e:
-                wer_rows.append({
-                    "Reference": ref,
-                    "Hypothesis": hyp,
-                    "WER": "Error"
-                })
-                logging.warning(f"WER computation failed for row: {e}")
+                error = "Error"
+                logging.warning(f"WER computation failed for {fname}: {e}")
+            wer_rows.append({"Filename": fname, "Reference": ref, "Hypothesis": hyp, "WER": error})
+        if not wer_rows:
+            return {"wer_output": "Error: no transcribed file has a reference transcript"}
         wer_df = pd.DataFrame(wer_rows)
         output_path = os.path.join(parent, 'results', "wer.csv")
         wer_df.to_csv(output_path, index=False)
@@ -1168,10 +1247,65 @@ node_map = {
     20: ("node_extension", extension_agent, "extension_output"),
     21: ("node_sample_rate", sample_rate_agent, "sample_rate_output"),
     22: ("speaker_duration",speaker_duration_agent, "speaker_duration_output"),
-    23: ("node_utterance_duplicate_checker",utterance_duplicate_checker_agent,"utterance_duplicate_checker_output"),
-    24: ("wer_computation",wer_computation_agent,"wer_computation_agent_output"),
+    23: ("node_utterance_duplicate_checker",utterance_duplicate_checker_agent,"utterance_duplicate_output"),
+    24: ("wer_computation",wer_computation_agent,"wer_output"),
     
 }
+
+# Explicit mentions always select their task (the same keyword rules the selection prompt states), so a
+# small local model cannot silently drop a check the user asked for by name.
+KEYWORD_TASKS = [(r"\bASR\b|transcri(be|ption)", 1), (r"number of speakers|diariz", 2), (r"transcript quality", 3),
+                 (r"character|grapheme", 4), (r"\bvocab", 5), (r"verify (the )?language|language verification|expected language", 6),
+                 (r"audio length", 7), (r"silence|\bVAD\b", 8), (r"english word", 9), (r"\bCTC\b", 10),
+                 (r"upsampl", 11), (r"new or old|valid speaker", 12), (r"\bdomain", 13), (r"forced alignment", 14),
+                 (r"IndicLID|language identification", 15), (r"normali[sz]|HTML", 16), (r"LLM score|LLM-as-a-judge|coherence", 17),
+                 (r"transliterat", 18), (r"corrupt", 19), (r"extension|file format", 20), (r"sample rate", 21),
+                 (r"speaker durations?|duration (for|of) each speaker|durations", 22), (r"duplicate", 23), (r"\bWER\b", 24)]
+
+
+def keyword_tasks(prompt: str) -> set:
+    return {task for pattern, task in KEYWORD_TASKS if re.search(pattern, prompt, re.IGNORECASE)}
+
+
+# Hard dependencies between tasks (the same rules the prompts give the LLM), enforced in code so a
+# small local model cannot schedule a task before its inputs exist.
+REFERENCE_TASKS = {9, 16, 23, 24}   # need results/indicconf_hypothesis-gt.csv
+TASK_DEPS = {3: [1], 4: [1], 5: [1], 6: [1], 10: [1], 13: [1], 14: [1], 15: [1], 16: [1], 17: [1],
+             12: [2], 22: [2], 9: [16], 23: [16], 24: [16]}
+
+
+def add_dependencies(tasks: set) -> set:
+    tasks, todo = set(tasks), list(tasks)
+    while todo:
+        for d in TASK_DEPS.get(todo.pop(), []):
+            if d not in tasks:
+                tasks.add(d)
+                todo.append(d)
+    return tasks
+
+
+def layer_tasks(tasks: set) -> list[list[int]]:
+    """Deterministic topological layering: each group holds tasks whose dependencies ran earlier."""
+    done, groups, left = set(), [], set(tasks)
+    while left:
+        ready = sorted(t for t in left if all(d in done or d not in tasks for d in TASK_DEPS.get(t, [])))
+        groups.append(ready)
+        done.update(ready)
+        left -= set(ready)
+    return groups
+
+
+def structure_is_valid(structure: list[list[int]], tasks: set) -> bool:
+    flat = [t for g in structure for t in g]
+    if sorted(flat) != sorted(tasks):
+        return False
+    seen = set()
+    for g in structure:
+        if any(d in tasks and d not in seen for t in g for d in TASK_DEPS.get(t, [])):
+            return False
+        seen.update(g)
+    return True
+
 
 def build_graph_from_structure(structure: list[list[int]], valid_tasks: set) -> StateGraph:
     graph_builder = StateGraph(CombinedStateDict)
@@ -1209,8 +1343,13 @@ def build_graph_from_structure(structure: list[list[int]], valid_tasks: set) -> 
     else:
         raise ValueError("No valid tasks provided in structure")
     return graph_builder.compile()
-def main(user_prompt: str):
-    parsed_inputs = parse_prompt(user_prompt)
+def main(user_prompt: str, audio_dir: Optional[str] = None, lang_code: Optional[str] = None):
+    """audio_dir/lang_code given (run_qc.py) are used as is; otherwise both are parsed from the prompt
+    (a POSIX absolute path in quotes)."""
+    if audio_dir:
+        parsed_inputs = {"audio_dir": os.path.abspath(audio_dir), "ground_truth_csv": None, "lang_code": lang_code}
+    else:
+        parsed_inputs = parse_prompt(user_prompt)
     if not parsed_inputs["audio_dir"] and not parsed_inputs["ground_truth_csv"]:
         logging.error("No valid audio directory or ground truth CSV provided in prompt")
         print("Error: Please provide audio directory and/or ground truth CSV in the prompt")
@@ -1218,8 +1357,29 @@ def main(user_prompt: str):
     resp_1 = select_tasks(user_prompt)
     
     verified_tasks = prompt_checker_agent(user_prompt, resp_1)
-    valid_tasks = set(verified_tasks.split(',')) if verified_tasks else set()
+    tasks = {int(x) for x in verified_tasks.split(',') if x.strip().isdigit() and 1 <= int(x) <= 24}
+    named = keyword_tasks(user_prompt) - tasks
+    if named:
+        logging.info(f"Added tasks named in the prompt but not selected by the LLM: {sorted(named)}")
+        tasks |= named
+    with_deps = add_dependencies(tasks)
+    if with_deps != tasks:
+        logging.info(f"Added dependency tasks: {sorted(with_deps - tasks)}")
+    tasks = with_deps
+    # English-word count, normalization, duplicates and WER read the reference transcripts: without them they can
+    # only fail, so drop them even when the planner picked them
+    reference = parsed_inputs["ground_truth_csv"] or (parsed_inputs["audio_dir"] and os.path.join(
+        results_dir(parsed_inputs["audio_dir"]), "indicconf_hypothesis-gt.csv"))
+    if not (reference and os.path.isfile(reference)) and tasks & REFERENCE_TASKS:
+        logging.info(f"No reference transcripts: skipping tasks {sorted(tasks & REFERENCE_TASKS)}")
+        print(f"No reference transcripts: skipping tasks {sorted(tasks & REFERENCE_TASKS)} (need indicconf_hypothesis-gt.csv)")
+        tasks -= REFERENCE_TASKS
+    verified_tasks = ','.join(map(str, sorted(tasks)))
+    valid_tasks = {str(x) for x in tasks}
     structure = topological_sort_tasks(verified_tasks)
+    if not structure_is_valid(structure, tasks):
+        logging.info(f"LLM structure {structure} breaks a dependency or drops a task; using deterministic layering")
+        structure = layer_tasks(tasks)
     print("Using structure:", structure)
 
     main_graph = build_graph_from_structure(structure, valid_tasks)

@@ -1,0 +1,6 @@
+.venv/
+models/
+pipeline.log
+__pycache__/
+log.txt
+*_qc/
