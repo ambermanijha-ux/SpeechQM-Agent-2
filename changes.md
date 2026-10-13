@@ -61,6 +61,8 @@ New files:
   removed, stale references cleared), skips macOS `._*` metadata files, and matches a transcript JSON to its audio
   by exact name or by the audio name as a whole token (`sample_1` no longer also matches `sample_10_x.json`).
 - IndicLID is downloaded with progress into a temporary folder and moved into place only when complete.
+- `run.sh` keeps a Mac awake during the run (`caffeinate -i`): a full run with the Mac idle-sleeping 28 times took
+  over 6 hours instead of about 2.
 - Git: `setup.sh` / `run.sh` are stored executable; `.gitattributes` keeps `.sh`/`.py` LF and `.bat`/`.ps1` CRLF
   regardless of the user's `core.autocrlf`.
 
@@ -115,6 +117,8 @@ with the fallbacks.
 | Word splitting (5, 6, 9, 24) | contractions split in two ("don't" → "don", "t"), overcounting English words by ~4 % | apostrophes/hyphens inside a word keep it one word |
 | Code-writing agent | qwen3:8b mis-copied a long path (two characters dropped) in all 3 attempts | `fix_paths` replaces near-miss path literals with the real path |
 | Prompt checker | added unrequested tasks (29 % of planned actions on an 18-query benchmark) | its additions are ignored; it can only remove (6 %) |
+| LLM score (17) | the judge gave ASR transcripts and the same words shuffled the same score | gated: scored only when transcript quality passes, ASR alignment ≥ 0.5 and IndicBERTv2 pseudo-perplexity ≤ 150 (calibrated: human references 10-53, shuffled 397-1512); otherwise empty with the reason |
+| Transliteration (18) | one LLM answer per word could be wrong but plausible | converted only when two differently worded LLM runs agree and, when available, IndicXlit lists the same spelling in its top 5 (`docker/indicxlit` for Mac/Windows); per-word decisions in `transliteration_words.csv` |
 
 ## 7. Unchanged on purpose
 

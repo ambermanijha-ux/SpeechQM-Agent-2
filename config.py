@@ -64,6 +64,10 @@ INDICBERT_TOKENIZER = "ai4bharat/IndicBERTv2-MLM-only"
 DIAR_WINDOW_S = 3.0             # embedding window (tuned on 3 labelled Hindi clips: 1, 2 and 3 speakers all correct)
 DIAR_HOP_S = 1.5
 DIAR_CLUSTER_THRESHOLD = 0.7    # cosine distance at which two windows stop being merged within a file
+# fluency gate for the LLM score (task 17): IndicBERTv2 pseudo-perplexity. Calibrated on 11 human reference
+# transcripts (9.7-52.5) vs the same words shuffled (397-1512); 150 lies between the two
+FLUENCY_MAX_PPL = float(os.environ.get("FLUENCY_MAX_PPL", "150"))
+FLUENCY_MIN_ALIGN = float(os.environ.get("FLUENCY_MIN_ALIGN", "0.5"))   # CTC alignment score of the ASR transcript
 SPEAKER_MATCH_THRESHOLD = float(os.environ.get("SPEAKER_MATCH_THRESHOLD", "0.6"))   # cosine similarity: same speaker across files (both backends)
 
 

@@ -28,11 +28,13 @@ from utility_functions import (
     language_identification_indiclid,
     transliterate_file,
     align_model_for,
+    pseudo_perplexity,
     get_required_inputs
 )
 import librosa
 import pandas as pd
-from config import OLLAMA_BASE_URL, PLANNER_MODEL, CODER_MODEL, LLM_NUM_CTX, LANG_CODES, DEFAULT_LANGUAGE, SCRIPTS
+from config import (OLLAMA_BASE_URL, PLANNER_MODEL, CODER_MODEL, LLM_NUM_CTX, LANG_CODES, DEFAULT_LANGUAGE, SCRIPTS,
+                    FLUENCY_MAX_PPL, FLUENCY_MIN_ALIGN)
 logging.basicConfig(filename="pipeline.log", level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 # Local LLMs through Ollama (originally gpt-4.1-mini via the OpenAI API)
 def local_llm(model):
@@ -1056,7 +1058,10 @@ def normalization_remove_tags_agent(state: CombinedStateDict) -> CombinedStateDi
         return {"normalization_remove_tags_output": f"Error: {e}"}
 
 def llm_score_agent(state: CombinedStateDict) -> CombinedStateDict:
-    """LLM-as-a-judge: the local LLM scores each transcription's coherence and fluency (0-10)."""
+    """LLM-as-a-judge, gated by measured signals. Every file gets three numbers that cannot be hallucinated:
+    transcript quality (task 3), CTC alignment of the ASR transcript (task 14, else computed here) and the language
+    model's pseudo-perplexity. Only transcripts that pass all three are scored 0-10 by the LLM; on the others the
+    judge cannot tell the transcript from shuffled words (tested), so LLM_Score stays empty with the reason."""
     audio_dir = state.get('audio_dir')
     if not audio_dir or not os.path.isdir(audio_dir):
         logging.error(f"Invalid audio directory for LLM score: {audio_dir}")
@@ -1070,25 +1075,53 @@ def llm_score_agent(state: CombinedStateDict) -> CombinedStateDict:
         df = pd.read_csv(csv_path)
         fcol = next(c for c in df.columns if c.lower() == "filename")
         tcol = next(c for c in df.columns if c.lower() in ("ground_truth", "transcriptions", "transcription", "indiconformer_hypothesis"))
+        def column(name, key, value):
+            p = os.path.join(res, name)
+            if not os.path.isfile(p):
+                return {}
+            d = pd.read_csv(p)
+            return dict(zip(d[key].astype(str), d[value])) if {key, value} <= set(d.columns) else {}
+        quality = column("transcript_quality.csv", fcol, "Quality_Check")
+        align = column("audio_transcript_matching.csv", "Filename", "CTC_Score")
         rows = []
-        for fname, text in zip(df[fcol], df[tcol].fillna("").astype(str)):
-            prompt = f"""You are a strict judge of {language_of(state)} speech transcriptions.
+        for fname, text in zip(df[fcol].astype(str), df[tcol].fillna("").astype(str)):
+            if fname not in align or pd.isna(align[fname]):   # task 14 missing or failed: align here
+                try:
+                    align[fname] = force_alignment_and_ctc_score(os.path.join(audio_dir, fname), text,
+                                                                 align_model_for(language_of(state)))[1]
+                except Exception as e:
+                    logging.warning(f"alignment for the fluency gate failed on {fname}: {e}")
+                    align[fname] = None
+            ppl = pseudo_perplexity(text)
+            reasons = []
+            if not str(quality.get(fname, "passed")).startswith("passed"):
+                reasons.append(f"transcript quality {quality[fname]}")
+            if align[fname] is None or float(align[fname]) < FLUENCY_MIN_ALIGN:
+                reasons.append(f"alignment {align[fname] if align[fname] is None else round(float(align[fname]), 2)} < {FLUENCY_MIN_ALIGN}")
+            if ppl is None or ppl > FLUENCY_MAX_PPL:
+                reasons.append(f"perplexity {ppl if ppl is None else round(ppl)} > {FLUENCY_MAX_PPL:g} (closer to shuffled words than to fluent text)")
+            row = {"Filename": fname, "Transcription": text, "LM_Pseudo_Perplexity": None if ppl is None else round(ppl, 1),
+                   "Alignment_Score": None if align[fname] is None else round(float(align[fname]), 3),
+                   "Transcript_Quality": quality.get(fname), "Fluency_Gate": "passed" if not reasons else "failed: " + "; ".join(reasons),
+                   "LLM_Score": None, "Evaluation_Comment": "not scored by the LLM: " + "; ".join(reasons) if reasons else None}
+            if not reasons:
+                prompt = f"""You are a strict judge of {language_of(state)} speech transcriptions.
     Evaluate the coherence and fluency of this transcription. Understand the meaning before scoring; do not give every transcription the same score.
     Score from 0 to 10: 10 for fluent, meaningful sentences, lower the more meaningless it gets, and 0 if it is in a language other than {language_of(state)}.
     Reply in exactly this format:
     Score: <0-10>
     Comment: <one sentence>
     Transcription: {text[:4000]}"""
-            try:
-                out = llm.invoke(prompt).content
-                m = re.search(r'Score:\s*(\d+(?:\.\d+)?)', out)
-                c = re.search(r'Comment:\s*(.*)', out, re.DOTALL)
-                score = min(10.0, float(m.group(1))) if m else None
-                comment = c.group(1).strip() if c else out.strip()
-            except Exception as e:
-                logging.warning(f"LLM score failed for {fname}: {e}")
-                score, comment = None, f"Error: {e}"
-            rows.append({"Filename": fname, "Transcription": text, "LLM_Score": score, "Evaluation_Comment": comment})
+                try:
+                    out = llm.model_copy(update={"num_predict": 200}).invoke(prompt).content
+                    m = re.search(r'Score:\s*(\d+(?:\.\d+)?)', out)
+                    c = re.search(r'Comment:\s*(.*)', out, re.DOTALL)
+                    row["LLM_Score"] = min(10.0, float(m.group(1))) if m else None
+                    row["Evaluation_Comment"] = c.group(1).strip() if c else "Error: reply had no score"
+                except Exception as e:
+                    logging.warning(f"LLM score failed for {fname}: {e}")
+                    row["Evaluation_Comment"] = f"Error: {e}"
+            rows.append(row)
         output_path = os.path.join(res, "llm_scores.csv")
         pd.DataFrame(rows).to_csv(output_path, index=False)
         return {"llm_score_output": f"CSV saved at: {output_path}"}
@@ -1321,7 +1354,7 @@ def keyword_tasks(prompt: str) -> set:
 # Hard dependencies between tasks (the same rules the prompts give the LLM), enforced in code so a
 # small local model cannot schedule a task before its inputs exist.
 REFERENCE_TASKS = {9, 16, 18, 23, 24}   # need results/indicconf_hypothesis-gt.csv
-TASK_DEPS = {3: [1, 8], 4: [1], 5: [1], 6: [1], 10: [1], 13: [1], 14: [1], 15: [1], 16: [1], 17: [1],
+TASK_DEPS = {3: [1, 8], 17: [1, 3, 14], 4: [1], 5: [1], 6: [1], 10: [1], 13: [1], 14: [1], 15: [1], 16: [1],
              12: [2], 22: [2], 9: [16], 23: [16], 24: [16]}
 
 

@@ -93,7 +93,8 @@ prompt ──► select_tasks (LLM) ──► prompt_checker_agent (LLM, ≤ 3 r
 | Check | Needs |
 |---|---|
 | 3 | 1 (ASR transcript), 8 (silence, for the speech duration) |
-| 4, 5, 6, 10, 13, 14, 15, 16, 17 | 1 (ASR transcript) |
+| 17 | 1, 3 (quality), 14 (ASR alignment) |
+| 4, 5, 6, 10, 13, 14, 15, 16 | 1 (ASR transcript) |
 | 12, 22 | 2 (speaker table) |
 | 9, 23, 24 | 16 (normalized reference) |
 
@@ -120,8 +121,8 @@ Implementation types: **model** = fixed code around a speech/text model; **code*
 | 14 | Forced alignment | `audio_transcript_matching.csv` | agent | script calls `force_alignment_and_ctc_score` with the language's model |
 | 15 | Language identification | `indiclid_language_identification.csv` | model | IndicLID (6.5) |
 | 16 | Normalization (remove tags) | `normalized_list.csv` | agent | removes HTML/XML-style tags from the reference |
-| 17 | LLM score | `llm_scores.csv` | judge | 0–10 coherence/fluency + comment |
-| 18 | Transliteration | `*_transliterated.csv` | model/judge | reference only; IndicXlit if installed, else the LLM maps the Roman words (JSON, batches of 40, answers outside the target script rejected) and only those words are replaced; `roman_words_left`; skipped for English |
+| 17 | LLM score | `llm_scores.csv` | judge (gated) | perplexity (`pseudo_perplexity`, IndicBERTv2), alignment (task 14) and quality (task 3) for every file; the LLM's 0–10 score only when all pass (`FLUENCY_MAX_PPL` 150, `FLUENCY_MIN_ALIGN` 0.5) |
+| 18 | Transliteration | `*_transliterated.csv`, `transliteration_words.csv` | model + judge | reference only; a Roman word is replaced only when two LLM runs (different prompts, JSON, batches of 40) agree, the answer is in the script and, if IndicXlit is available (installed or the `speechqm-indicxlit` Docker image), it is in IndicXlit's top 5; skipped for English |
 | 19 | Corruption | `corruption_check.csv` | agent | empty, unreadable by soundfile, or `.mp3` → corrupt (SpeechQM rule) |
 | 20 | File extension | `audio_format_check.csv` | agent | `.wav` valid |
 | 21 | Sample rate | `sample_rate_check.csv` | agent | 16 kHz → Pass |

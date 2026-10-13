@@ -632,7 +632,9 @@ implemented, are tabulated in `implementation.md` §4; the groups are:
   12 new/old speaker,
   22 speaker hours, 23 duplicates, 24 WER): deterministic, same result every run.
 - **LLM judge** (13 domain, 17 fluency score): the LLM reads each transcript and answers; the reply is parsed
-  with a regex (`Score: 7` → 7).
+  with a regex (`Score: 7` → 7). The fluency score is gated: `pseudo_perplexity` (IndicBERTv2 masks a sample of up
+  to 400 tokens one at a time and averages how surprised it is), the ASR alignment score and transcript quality
+  are measured first, and only transcripts passing all three are sent to the LLM.
 - **Code-writing agent** (4 characters, 7 length, 14 forced alignment, 16 normalization,
   19 corruption, 20 extension, 21 sample rate): the LLM writes a Python script, see below.
 
@@ -755,12 +757,14 @@ resampled every file to 16 kHz first, which made every 8 kHz file look upsampled
 ### 12.8 Transliteration
 
 `transliterate_file(csv, lang_code, llm)`: converts romanized words to native script with AI4Bharat IndicXlit if
-it is installed (it needs `fairseq`, which has no Apple Silicon/Windows build), otherwise asks the local LLM. The LLM is given only the unique Roman-script words, 40 at a time, and replies with
-a JSON word map (reply length capped); an answer that is not in the language's script is rejected, and only those
-words are replaced in the text, so nothing else in the transcript can change. `[tags]` stay as they are.
-(Asking the LLM to rewrite a whole transcript made it generate for over 14 minutes without finishing.)
-Writes `<input>_transliterated.csv` with `roman_words_left` (words still in Roman script). Needs reference
-transcripts; skipped for English.
+it is installed (it needs `fairseq`, which has no Apple Silicon/Windows build), asks the local LLM twice. Only the unique Roman-script words are sent, 40 at a time, with two differently worded
+prompts, each answered with a JSON word map (reply length capped). A word is replaced only if both answers are the
+same, in the language's script, and, when IndicXlit is available (installed on Linux, or the Docker image built
+from `docker/indicxlit` via `xlit_candidates`), among IndicXlit's top 5 spellings. Only those words are replaced,
+so nothing else in the transcript can change; `[tags]` stay as they are. (Asking the LLM to rewrite a whole
+transcript made it generate for over 14 minutes without finishing.) Writes `<input>_transliterated.csv` with
+`roman_words_left` and `transliteration_words.csv` (both LLM answers, IndicXlit's candidates and the decision per
+word). Needs reference transcripts; skipped for English.
 
 ---
 

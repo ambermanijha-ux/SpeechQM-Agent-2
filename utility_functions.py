@@ -60,79 +60,123 @@ def language_identification_indiclid(transcription: str) -> List[Tuple[str, str,
 
 
 # ---------------------------------------------------------------- transliteration
-def transliterate_file(file_path: str, lang_code: str, llm=None) -> str:
-    """Roman -> native script. Uses AI4Bharat IndicXlit when installed (needs fairseq, which does not
-    build on Apple Silicon); otherwise asks the local LLM."""
+XLIT_IMAGE = os.environ.get("XLIT_DOCKER_IMAGE", "speechqm-indicxlit")   # built from docker/indicxlit
+
+
+def xlit_candidates(words, lang_code, topk=5):
+    """AI4Bharat IndicXlit's top-k native spellings per Roman word, or None when IndicXlit is not available.
+    Natively when ai4bharat-transliteration is installed (Linux), else through the Docker image (Mac/Windows)."""
+    if not words:
+        return {}
     try:
-        from config import LANG_CODES
+        from ai4bharat.transliteration import XlitEngine
+        if not hasattr(np, 'float'):
+            np.float = float
+        engine = XlitEngine(lang_code, beam_width=10, src_script_type="roman")
+        out = {}
+        for w in words:
+            r = engine.translit_word(w, topk=topk)
+            out[w] = r.get(lang_code, []) if isinstance(r, dict) else r
+        return out
+    except ImportError:
+        pass
+    import shutil
+    import subprocess
+    if not shutil.which("docker"):
+        return None
+    try:
+        if subprocess.run(["docker", "image", "inspect", XLIT_IMAGE], capture_output=True).returncode != 0:
+            return None
+        r = subprocess.run(["docker", "run", "--rm", "-i", XLIT_IMAGE], input=json.dumps({"lang": lang_code, "words": words}),
+                           capture_output=True, text=True, timeout=1800)
+        return json.loads(r.stdout[r.stdout.index("{"):]) if r.returncode == 0 else None
+    except Exception as e:
+        logging.warning(f"IndicXlit container failed: {e}")
+        return None
+
+
+def transliterate_file(file_path: str, lang_code: str, llm=None) -> str:
+    """Roman -> native script for the Roman-script words of the reference transcripts.
+    A word is converted only when two independent answers agree:
+      - two LLM runs with differently worded prompts give the same spelling, in the language's script, and
+      - when IndicXlit is available (installed, or the Docker image), that spelling is one of its top-5 candidates.
+    Without an LLM, IndicXlit's top candidate is used. Everything else stays in Roman script (counted in
+    roman_words_left). Only the words themselves are replaced, so the rest of the transcript cannot change.
+    Writes <input>_transliterated.csv and a per-word decision table transliteration_words.csv."""
+    try:
+        from config import LANG_CODES, SCRIPTS
         supported_langs = {c for c, name in LANG_CODES.items() if name != "English"}
         if lang_code not in supported_langs:
-            raise ValueError(f"Unsupported language code: {lang_code}. Supported codes: {', '.join(supported_langs)}")
+            raise ValueError(f"Unsupported language code: {lang_code}. Supported codes: {', '.join(sorted(supported_langs))}")
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"Input file not found: {file_path}")
         df = pd.read_csv(file_path)
         if "ground_truth" not in df.columns:
             raise ValueError("Column 'ground_truth' not found in the CSV file")
-        try:
-            from ai4bharat.transliteration import XlitEngine
-            if not hasattr(np, 'float'):
-                np.float = float
-            engine = XlitEngine(beam_width=10, src_script_type="roman")
+        language = LANG_CODES[lang_code]
+        script, lo, hi = SCRIPTS[language]
+        token = r"\[[^\]]*\]|<[^>]*>|[A-Za-z][A-Za-z'-]*"   # [tags]/<tags> matched first and kept
+        words = list(dict.fromkeys(w for t in df["ground_truth"].fillna("").astype(str)
+                                   for w in re.findall(token, t) if w[0] not in "[<"))
+        norm = lambda v: str(v).replace("\u200c", "").replace("\u200d", "").strip()
+        in_script = lambda v: bool(v) and all(lo <= ord(ch) <= hi for ch in norm(v))
 
-            def translit(text):
-                result = engine.translit_sentence(str(text), lang_code)
-                return result[lang_code] if isinstance(result, dict) and lang_code in result else result
-        except ImportError:
-            if llm is None:
-                raise RuntimeError("IndicXlit is not installed and no LLM was given for transliteration")
-            logging.info("IndicXlit not installed; transliterating with the local LLM")
-            from config import LANG_CODES, SCRIPTS
-            language = LANG_CODES[lang_code]
-            script, lo, hi = SCRIPTS[language]
+        def ask(prompt_for, batch):
             bounded = llm.model_copy(update={"num_predict": 1500})   # an unbounded reply can loop for minutes
-            mapping = {}
-
-            def learn(batch):
-                """Ask for a JSON word map for a batch of Roman-script words; keep only answers in the target
-                script, so the model cannot rewrite, drop or invent anything else in the transcript."""
-                prompt = (f"Transliterate each romanized word into {language} ({script} script), as it would be "
-                          f"written in {language}. Do not translate. Reply with only a JSON object mapping each "
-                          f"given word to its transliteration.\nWords: {json.dumps(batch)}")
-                reply = bounded.invoke(prompt).content
-                m = re.search(r"\{.*\}", reply, re.DOTALL)
-                try:
-                    got = json.loads(m.group(0)) if m else {}
-                except json.JSONDecodeError:
-                    got = {}
-                for w in batch:
-                    v = str(got.get(w, "")).strip()
-                    if v and all(lo <= ord(ch) <= hi or ch in " \u200c\u200d" for ch in v):
-                        mapping[w] = v
-
-            def translit(text):
-                # [tags] and <tags> are matched first and kept as they are
-                token = r"\[[^\]]*\]|<[^>]*>|[A-Za-z][A-Za-z'-]*"
-                roman = [w for w in dict.fromkeys(re.findall(token, str(text)))
-                         if w[0] not in "[<" and w not in mapping]
-                for i in range(0, len(roman), 40):
-                    learn(roman[i:i + 40])
-                return re.sub(token, lambda m: mapping.get(m.group(0), m.group(0)), str(text))
-
-        def transliterate(text):
-            if pd.isna(text) or str(text).strip() == "":
-                return ""
+            reply = bounded.invoke(prompt_for(batch)).content
+            got = {}
+            m = re.search(r"\{.*\}", reply, re.DOTALL)
             try:
-                return translit(text)
-            except Exception as e:
-                print(f"Error transliterating '{text}': {e}")
-                return text
-        df["ground_truth_transliterated"] = df["ground_truth"].apply(transliterate)
-        # Roman-script words left untransliterated (not mapped, or the model's answer was rejected)
-        df["roman_words_left"] = df["ground_truth_transliterated"].fillna("").astype(str).apply(
+                obj = json.loads(m.group(0)) if m else {}
+                got = obj if isinstance(obj, dict) and "spelling" not in obj else {}
+            except json.JSONDecodeError:
+                pass
+            # also accept a list of {"word": ..., "spelling": ...} objects
+            for o in re.findall(r"\{[^{}]*\}", reply):
+                try:
+                    o = json.loads(o)
+                    if isinstance(o, dict) and "word" in o:
+                        got.setdefault(o["word"], next((v for k, v in o.items() if k != "word"), ""))
+                except json.JSONDecodeError:
+                    pass
+            return {w: norm(got.get(w, "")) for w in batch}
+        prompts = [
+            lambda b: (f"Transliterate each romanized word into {language} ({script} script), as it would be written in "
+                       f"{language}. Do not translate. Reply with only a JSON object mapping each given word to its "
+                       f"transliteration.\nWords: {json.dumps(b)}"),
+            lambda b: (f"These words occur in a {language} conversation, typed in Latin letters (many are English "
+                       f"loanwords). Write how each is spelled in {script} script by {language} speakers - same sound, "
+                       f"not a translation. Answer with one JSON object mapping each word to its spelling, e.g. {{\"{b[0]}\": \"...\"}}, and nothing else.\n{json.dumps(b)}"),
+        ]
+        runs = [{}, {}]
+        if llm is not None:
+            for i in range(0, len(words), 40):
+                for k in (0, 1):
+                    runs[k].update(ask(prompts[k], words[i:i + 40]))
+        xlit = xlit_candidates(words, lang_code)
+        mapping, table = {}, []
+        for w in words:
+            a, b = runs[0].get(w, ""), runs[1].get(w, "")
+            cands = [norm(c) for c in (xlit or {}).get(w, [])]
+            if llm is not None and a and a == b and in_script(a) and (xlit is None or a in cands):
+                mapping[w], source = a, "LLM x2 + IndicXlit" if xlit is not None else "LLM x2"
+            elif llm is None and cands and in_script(cands[0]):
+                mapping[w], source = cands[0], "IndicXlit"
+            else:
+                source = ("left: LLM runs disagree" if a != b else "left: not in the script" if not in_script(a)
+                          else "left: IndicXlit does not list it")
+            table.append({"word": w, "llm_run_1": a, "llm_run_2": b, "indicxlit_top5": json.dumps(cands, ensure_ascii=False)
+                          if xlit is not None else "", "result": mapping.get(w, w), "source": source})
+        df["ground_truth_transliterated"] = df["ground_truth"].fillna("").astype(str).apply(
+            lambda t: re.sub(token, lambda m: mapping.get(m.group(0), m.group(0)), t))
+        df["roman_words_left"] = df["ground_truth_transliterated"].apply(
             lambda t: len(re.findall(r"[A-Za-z][A-Za-z'-]*", re.sub(r"\[[^\]]*\]|<[^>]*>", " ", t))))
         base, ext = os.path.splitext(file_path)
         output_path = f"{base}_transliterated.csv"
         df.to_csv(output_path, index=False, encoding='utf-8')
+        pd.DataFrame(table).to_csv(os.path.join(os.path.dirname(file_path), "transliteration_words.csv"), index=False)
+        logging.info(f"transliteration: {len(mapping)}/{len(words)} words converted; IndicXlit "
+                     f"{'used' if xlit is not None else 'not available'}")
         return f"Output saved at: {output_path}"
     except Exception as e:
         print(f"Error in transliterate_file: {e}")
@@ -469,6 +513,50 @@ def transcript_quality(transcript, speech_seconds=None, min_chars_per_s=5.0, max
         if rate < min_chars_per_s:
             return f"failed: too little text for the speech ({rate:.1f} letters/s)"
     return "passed"
+
+
+# ---------------------------------------------------------------- language-model fluency (pseudo-perplexity)
+@lru_cache(maxsize=1)
+def get_mlm():
+    """IndicBERTv2 masked language model (23 Indic languages + English), the same repo as IndicLID's tokenizer."""
+    from transformers import AutoModelForMaskedLM
+    with MODEL_LOCK:
+        tokenizer = AutoTokenizer.from_pretrained(INDICBERT_TOKENIZER)
+        model = AutoModelForMaskedLM.from_pretrained(INDICBERT_TOKENIZER).to(DEVICE).eval()
+        return tokenizer, model
+
+
+def pseudo_perplexity(text, sample=400, context=126, batch=32, seed=0):
+    """Pseudo-perplexity of a text under the masked LM: mask one token at a time (with `context` tokens on each
+    side) and average -log p(true token). Fluent text has low values; word salad (ASR garbage, shuffled words) high.
+    Measured on up to `sample` evenly spread tokens, so long transcripts cost the same as short ones. A number
+    computed from model probabilities: it cannot be hallucinated."""
+    tokenizer, model = get_mlm()
+    ids = tokenizer(str(text), add_special_tokens=False)["input_ids"]
+    if len(ids) < 5:
+        return None
+    positions = np.linspace(0, len(ids) - 1, min(sample, len(ids))).round().astype(int)
+    cls, sep, mask = tokenizer.cls_token_id, tokenizer.sep_token_id, tokenizer.mask_token_id
+    nll = []
+    for b in range(0, len(positions), batch):
+        rows, targets, where = [], [], []
+        for p in positions[b:b + batch]:
+            lo, hi = max(0, p - context), min(len(ids), p + context + 1)
+            window = [cls] + ids[lo:hi] + [sep]
+            k = p - lo + 1
+            targets.append(window[k]); window[k] = mask
+            rows.append(window); where.append(k)
+        width = max(map(len, rows))
+        input_ids = torch.tensor([r + [tokenizer.pad_token_id] * (width - len(r)) for r in rows])
+        attention = torch.tensor([[1] * len(r) + [0] * (width - len(r)) for r in rows])
+        with MODEL_LOCK, torch.no_grad():
+            # vocabulary scores only at the masked positions: for all positions they would be
+            # batch x tokens x 250k floats (~8 GB per batch)
+            hidden = model.bert(input_ids=input_ids.to(DEVICE), attention_mask=attention.to(DEVICE)).last_hidden_state
+            logits = model.cls(hidden[torch.arange(len(rows)), torch.tensor(where)]).float().cpu()
+        logp = torch.log_softmax(logits, dim=-1)
+        nll += (-logp[torch.arange(len(rows)), torch.tensor(targets)]).tolist()
+    return float(np.exp(np.mean(nll)))
 
 
 # ---------------------------------------------------------------- forced alignment / CTC score

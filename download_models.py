@@ -84,8 +84,8 @@ def ensure_hf(languages, speech_backend="pyannote"):
     for repo in dict.fromkeys(repos):
         print(f"hf: {repo}")
         snapshot_download(repo, allow_patterns=HF_WEIGHTS)   # offline: resolves from the cache
-    print(f"hf: {INDICBERT_TOKENIZER} (tokenizer only)")
-    snapshot_download(INDICBERT_TOKENIZER, allow_patterns=["*.json", "*.model", "*.txt"])
+    print(f"hf: {INDICBERT_TOKENIZER} (IndicLID tokenizer and fluency language model, ~1.1 GB)")
+    snapshot_download(INDICBERT_TOKENIZER, allow_patterns=HF_WEIGHTS)
     # loading once downloads everything the VAD/diarization models pull in (embedding model, PLDA, ECAPA)
     import utility_functions as U
     print(f"speech: {speech_backend} VAD + diarization")

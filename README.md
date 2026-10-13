@@ -152,20 +152,23 @@ audio_qc/
 | ASR_Transcript_Quality | `passed`, or `failed:` with the reason (almost empty, looping, or far too little text for the speech: the ASR model dropped speech) | `failed` |
 | CTC_Score, CTC_Status, CTC_Scored_Text | how well the transcript aligns with the audio, 0-1; Good > 0.7, Medium > 0.5; the file's reference if it has one, else the ASR transcript | `Poor` |
 | ASR_Alignment_Score | forced-alignment score of the ASR transcript (task 14). High even when the ASR left out speech: it scores the text that is there | |
-| LLM_Score | 0-10 fluency/coherence of the ASR transcript judged by the local LLM | low |
+| LM_Perplexity | how predictable the ASR transcript is to a language model (IndicBERTv2); human transcripts measure ~10-50, shuffled words ~400-1500 | > 150 |
+| Fluency_Gate | `passed`, or `failed:` with the reasons (transcript quality, alignment < 0.5, perplexity > 150) | `failed` |
+| LLM_Score | 0-10 fluency/coherence judged by the local LLM, only for transcripts that pass Fluency_Gate (empty otherwise) | low |
 | Domain | topic (Healthcare, Insurance, Finance, Sales, Daily Life, ...) | unexpected topic |
 | WER | word error rate of ASR vs reference (needs reference) | |
 | English_Words_in_Reference | Latin-script words in the reference transcript | |
-| Roman_Words_Left_After_Transliteration | Roman-script words the transliteration could not convert | |
+| Roman_Words_Left_After_Transliteration | Roman-script words not converted, because the two sources did not agree (see 7) | |
 
 **Reading WER:** the ASR writes everything in the language's own script, while many references write English words
 in Latin script ("Hospital", "insurance"). Every such word counts as an error, so WER is high on code-mixed speech
 even when recognition is good. Compare WER between files and vendors rather than against an absolute target.
 
 **Reading LLM_Score and Domain:** both are judged from the ASR transcript. With a weak ASR model the transcript is
-close to word salad: in our tests the judge gave the ASR text and the same words in random order the same score
-(about 3), while human reference transcripts scored about 6.5. Low scores therefore say "the ASR output is poor"
-more than "the speech is poor", and the domain is less reliable for such files (check ASR_Transcript_Quality).
+close to word salad, and an LLM judge cannot tell it from the same words shuffled (we tested: both scored about 3,
+human transcripts about 6.5). So the LLM only scores transcripts that pass measured checks first (Fluency_Gate);
+for the rest LLM_Score is empty and the measured values say why. The domain is less reliable for files that fail
+the gate.
 
 ## 7. Models used
 
@@ -179,6 +182,15 @@ more than "the speech is poor", and the domain is less reliable for such files (
 | ASR other languages | Vakyansh (`Harveenchadha/vakyansh-wav2vec2-<language>-...`) | same (not gated) |
 | CTC alignment | Vakyansh Hindi for Hindi, otherwise the language's ASR model | same |
 | Language identification | AI4Bharat IndicLID (FastText + IndicBERT) | same |
+| Fluency (perplexity) | `ai4bharat/IndicBERTv2-MLM-only` (~1.1 GB) | same |
+| Transliteration | two `qwen3:8b` runs that must agree, checked against AI4Bharat IndicXlit when available (see below) | words stay in Roman script |
+
+**Transliteration and IndicXlit (optional).** A Roman-script word in a reference is converted to the native script
+only when two independent answers agree: two differently worded LLM runs, and AI4Bharat's IndicXlit model listing
+the same spelling among its top 5. IndicXlit needs `fairseq`, which only installs on Linux; on Linux run
+`.venv/bin/pip install ai4bharat-transliteration`, on Mac/Windows build its Docker image once (needs Docker Desktop,
+~3 GB): `docker build -t speechqm-indicxlit docker/indicxlit`. Without IndicXlit, two agreeing LLM runs are
+enough. Every word's answers and the decision are in `results/transliteration_words.csv`.
 
 Weak spots: the Malayalam (8 h of training data), Assamese (8 h) and Punjabi (10 h) Vakyansh models give poor
 transcripts; 8 kHz phone recordings transcribe worse than 16 kHz recordings.
@@ -193,7 +205,7 @@ transcripts; 8 kHz phone recordings transcribe worse than 16 kHz recordings.
 | `... is not inside a folder named after a language` | add `--language <name>` or rename the folders |
 | `./setup.sh: Permission denied` | `chmod +x setup.sh run.sh` |
 | PowerShell refuses to run `setup.ps1` | use exactly `powershell -ExecutionPolicy Bypass -File setup.ps1` |
-| Very slow | no GPU found: check the `Device:` line at step 4 (`cuda`, `mps` or `cpu`) |
+| Very slow | no GPU found: check the `Device:` line at step 4 (`cuda`, `mps` or `cpu`). On Windows/Linux, stop the computer from sleeping during a run (`run.sh` does this on a Mac with `caffeinate`) |
 | Out of memory | close other apps; or use a smaller LLM: `PLANNER_MODEL=qwen3:4b CODER_MODEL=qwen3:4b ./run.sh ...` |
 | Something failed for one language | the other languages still run; details are in `pipeline.log` in the project folder |
 
