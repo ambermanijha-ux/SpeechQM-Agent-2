@@ -599,13 +599,14 @@ Every value can be overridden by an environment variable of the same name, e.g. 
    task numbers.
 3. **`prompt_checker_agent(prompt, selection)`.** A second LLM call compares the selection with the prompt and
    answers `Status: Correct`, `Missing` (with which ones, then the selection is redone with that feedback) or
-   `Extra` (the extras are removed). Up to 3 rounds.
+   `Extra` (the extras are removed). Up to 3 rounds. Only its removals are used: tasks it adds are ignored,
+   because with qwen3:8b they were mostly never requested (see `implementation.md` §3).
 4. **Deterministic corrections** (because an 8B model gets steps 2-3 wrong regularly):
    - `keyword_tasks(prompt)`: regexes for each check's name ("sample rate" → 21, "WER" → 24, ...); any check the
      prompt names but the LLM dropped is added back.
    - `add_dependencies(tasks)`: adds prerequisites using `TASK_DEPS` (e.g. WER needs normalization, which needs
      ASR).
-   - `REFERENCE_TASKS` {9, 16, 23, 24} are removed when no reference CSV exists, with a message, since they
+   - `REFERENCE_TASKS` {9, 16, 18, 23, 24} are removed when no reference CSV exists, with a message, since they
      could only fail.
 5. **Ordering.** `topological_sort_tasks` asks the LLM for layers such as `[[1, 2, 7], [5, 6, 12], [24]]`.
    `structure_is_valid` checks that every task appears exactly once and comes after its prerequisites. If not,
@@ -736,9 +737,11 @@ task prompts in `llm.py`, but run the tool on data you are allowed to process, a
 
 ### 12.6 Upsampling
 
-`is_upsampled_from_8k_v2`: takes the frequency spectrum (FFT) of the 16 kHz audio; if less than 2 % of the energy
-is between 4 and 8 kHz, the recording has no real high-frequency content: it was narrowband (8 kHz, typical of
-phone calls) at some point, even if the file says 16 or 48 kHz.
+`is_upsampled_from_8k_v2`: takes the frequency spectrum (FFT) of the audio at the file's own sample rate; if the
+file is stored above 8 kHz and less than 2 % of the energy is between 4 and 8 kHz, the recording has no real
+high-frequency content: it was narrowband (8 kHz, typical of phone calls) and later upsampled, even though the file
+says 16 or 48 kHz. A file stored at 8 kHz is not upsampled (the sample rate check reports it). An earlier version
+resampled every file to 16 kHz first, which made every 8 kHz file look upsampled.
 
 ### 12.7 Language identification (IndicLID)
 
@@ -752,8 +755,12 @@ phone calls) at some point, even if the file says 16 or 48 kHz.
 ### 12.8 Transliteration
 
 `transliterate_file(csv, lang_code, llm)`: converts romanized words to native script with AI4Bharat IndicXlit if
-it is installed (it needs `fairseq`, which has no Apple Silicon/Windows build), otherwise asks the local LLM.
-Writes `<input>_transliterated.csv`. Only runs when a prompt asks for transliteration.
+it is installed (it needs `fairseq`, which has no Apple Silicon/Windows build), otherwise asks the local LLM. The LLM is given only the unique Roman-script words, 40 at a time, and replies with
+a JSON word map (reply length capped); an answer that is not in the language's script is rejected, and only those
+words are replaced in the text, so nothing else in the transcript can change. `[tags]` stay as they are.
+(Asking the LLM to rewrite a whole transcript made it generate for over 14 minutes without finishing.)
+Writes `<input>_transliterated.csv` with `roman_words_left` (words still in Roman script). Needs reference
+transcripts; skipped for English.
 
 ---
 

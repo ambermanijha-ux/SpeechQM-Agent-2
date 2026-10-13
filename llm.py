@@ -30,6 +30,7 @@ from utility_functions import (
     align_model_for,
     get_required_inputs
 )
+import librosa
 import pandas as pd
 from config import OLLAMA_BASE_URL, PLANNER_MODEL, CODER_MODEL, LLM_NUM_CTX, LANG_CODES, DEFAULT_LANGUAGE, SCRIPTS
 logging.basicConfig(filename="pipeline.log", level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -80,6 +81,28 @@ def run_code(code: str) -> str:
     return buf.getvalue()
 
 
+PATH_RE = r"(?:[A-Za-z]:)?/[^\s'\"]+"
+
+
+def fix_paths(code: str, prompt: str) -> str:
+    """Small models miscopy long paths (seen: '...fd5b0e03f1' written for '...fd5b0e0303f1', so the script looked
+    for a file that does not exist). Replace any path literal in the script that is nearly, but not exactly, one of
+    the paths given in the prompt with that path."""
+    import difflib
+    known = {m.rstrip(".,;:)") for m in re.findall(PATH_RE, prompt)}
+
+    def repair(m):
+        q, lit = m.group(1), m.group(2)
+        if lit in known or os.path.exists(lit):
+            return m.group(0)
+        best = max(known, key=lambda k: difflib.SequenceMatcher(None, lit, k).ratio(), default=None)
+        if best and difflib.SequenceMatcher(None, lit, best).ratio() >= 0.9:
+            logging.info(f"fixed a miscopied path in generated code: {lit} -> {best}")
+            return q + best + q
+        return m.group(0)
+    return re.sub(r"(['\"])(" + PATH_RE + r")\1", repair, code) if known else code
+
+
 def describe_inputs(task_prompt: str, output_path: str) -> str:
     """Show the model the real columns of the CSVs it is asked to read, so it does not guess them."""
     notes = []
@@ -124,7 +147,7 @@ def run_agent(task_prompt: str, output_path: str, expected_rows: Optional[int] =
     with AGENT_LOCK:
         for attempt in range(1, attempts + 1):
             reply = coder_llm.invoke(messages).content
-            code = extract_code(reply)
+            code = fix_paths(extract_code(reply), prompt)
             result = run_code(code) if code.strip() else "No code found in the reply."
             logging.info(f"agent attempt {attempt} for {os.path.basename(output_path)}:\n{code}\n--- output:\n{result[:2000]}")
             rows = csv_rows(output_path)   # None: missing, empty or unreadable
@@ -202,10 +225,14 @@ def parse_prompt(prompt: str) -> Dict[str, Optional[str]]:
     return result
 
 def words(text: str) -> list:
-    """Words of a transcript without [tags]/<tags> and punctuation; keeps Indic vowel signs (unicode category M)."""
+    """Words of a transcript without [tags]/<tags> and punctuation; keeps Indic vowel signs (unicode category M)
+    and apostrophes/hyphens inside a word (don't, check-up)."""
     import unicodedata
-    text = re.sub(r"\[[^\]]*\]|<[^>]*>", " ", str(text))
-    return "".join(" " if unicodedata.category(ch)[0] in "PSZC" else ch for ch in text).split()
+    t = re.sub(r"\[[^\]]*\]|<[^>]*>", " ", str(text))
+    inword = lambda ch: unicodedata.category(ch)[0] in "LMN"
+    return "".join(ch if inword(ch) or (ch in "'’-" and 0 < i < len(t) - 1 and inword(t[i - 1]) and inword(t[i + 1]))
+                   else " " if unicodedata.category(ch)[0] in "PSZ" or unicodedata.category(ch) == "Cc" else ch
+                   for i, ch in enumerate(t)).split()
 
 def language_of(state) -> str:
     """Language named in the prompt (via its code), else DEFAULT_LANGUAGE."""
@@ -720,10 +747,23 @@ def language_verification_agent(state: CombinedStateDict) -> CombinedStateDict:
 def ctc_score_agent(state: CombinedStateDict) -> CombinedStateDict:
     audio_dir = state.get('audio_dir')
     parent = os.path.dirname(audio_dir.rstrip("/\\"))
-    # score the ground truth against the audio when it is available, else the ASR hypothesis
-    gt_csv = os.path.join(parent, 'results', "indicconf_hypothesis-gt.csv")
-    csv_path = (state.get('ground_truth_csv') or (gt_csv if os.path.isfile(gt_csv) else None)
-                or state.get('A', os.path.join(parent, 'results', "indicconf_hypothesis.csv")))
+    # per file: score the reference against the audio when the file has one, else the ASR hypothesis
+    gt_csv = state.get('ground_truth_csv') or os.path.join(parent, 'results', "indicconf_hypothesis-gt.csv")
+    hyp_csv = state.get('A', os.path.join(parent, 'results', "indicconf_hypothesis.csv"))
+    csv_path, sources = hyp_csv, {}
+    gt_cols = {c.lower(): c for c in pd.read_csv(gt_csv, nrows=0).columns} if os.path.isfile(gt_csv) else {}
+    if {"filename", "ground_truth"} <= gt_cols.keys() and os.path.isfile(hyp_csv):
+        gt, hyp = pd.read_csv(gt_csv), pd.read_csv(hyp_csv)
+        refs = dict(zip(gt[gt_cols["filename"]].astype(str), gt[gt_cols["ground_truth"]]))
+        rows = []
+        for f, h in zip(hyp["Filename"].astype(str), hyp["Indiconformer_Hypothesis"]):
+            has_ref = f in refs and str(refs[f]).strip() not in ("", "nan")
+            rows.append({"Filename": f, "Transcription": refs[f] if has_ref else h})
+            sources[f] = "reference" if has_ref else "ASR"
+        csv_path = os.path.join(parent, 'results', "ctc_input.csv")
+        pd.DataFrame(rows).to_csv(csv_path, index=False)
+    elif os.path.isfile(gt_csv):
+        csv_path = gt_csv
     if not audio_dir or not os.path.isdir(audio_dir):
         logging.error(f"Invalid audio directory for CTC score: {audio_dir}")
         return {"ctc_score_output": "Error: Invalid audio directory"}
@@ -753,7 +793,10 @@ def ctc_score_agent(state: CombinedStateDict) -> CombinedStateDict:
             grouped['CTC_Status'] = grouped['CTC_Score'].apply(
                 lambda x: "Good" if float(x) > 0.7 else "Medium" if float(x) > 0.5 else "Poor"
             )
-            grouped = grouped[['Filename', 'Aligned_Segments', 'Aligned_Transcript', 'CTC_Score', 'CTC_Status']]
+            grouped['Transcript_Source'] = grouped['Filename'].astype(str).map(sources).fillna(
+                "reference" if csv_path == gt_csv else "ASR")
+            grouped = grouped[['Filename', 'Aligned_Segments', 'Aligned_Transcript', 'CTC_Score', 'CTC_Status',
+                               'Transcript_Source']]
             grouped.to_csv(output_path, index=False)
             logging.info(f"CTC scores saved to: {output_path}")
             return {"ctc_score_output": f"CSV saved at: {output_path}"}
@@ -774,7 +817,15 @@ def transcript_quality_agent(state: CombinedStateDict) -> CombinedStateDict:
     try:
         df = pd.read_csv(csv_path)
         col = next(c for c in df.columns if c.lower() in ("ground_truth", "transcription", "indiconformer_hypothesis"))
-        df['Quality_Check'] = df[col].fillna("").astype(str).apply(transcript_quality)
+        fcol = next(c for c in df.columns if c.lower() == "filename")
+        # speech time = duration - silence (task 8), so text-per-second is measured over speech only
+        audio = {f: librosa.get_duration(path=os.path.join(audio_dir, f)) for f in df[fcol]
+                 if os.path.isfile(os.path.join(audio_dir, f))}
+        sil_csv = os.path.join(os.path.dirname(csv_path), "vad_silence_stats.csv")
+        silence = dict(pd.read_csv(sil_csv).values[:, :2]) if os.path.isfile(sil_csv) else {}
+        speech = {f: d - float(silence.get(f, 0)) for f, d in audio.items()}
+        df['Speech_s'] = df[fcol].map(speech).round(1)
+        df['Quality_Check'] = [transcript_quality(t, speech.get(f)) for f, t in zip(df[fcol], df[col].fillna("").astype(str))]
         output_path = os.path.join(os.path.dirname(csv_path), "transcript_quality.csv")
         df.to_csv(output_path, index=False)
         return {"transcript_quality_output": f"CSV saved at: {output_path}"}
@@ -841,8 +892,12 @@ def domain_checker_agent(state: CombinedStateDict) -> CombinedStateDict:
             Domain: 
     """
             try:
-                response = llm.invoke(prompt)
-                domains.append(re.sub(r"^\W*domain\W*", "", response.content.strip(), flags=re.IGNORECASE))
+                # short bounded reply, accepted only if it names a listed domain: on long texts the model
+                # sometimes writes an essay instead of a label (seen on a Bengali reference transcript)
+                reply = llm.model_copy(update={"num_predict": 30}).invoke(prompt).content
+                reply = re.sub(r"^\W*domain\W*", "", reply.strip(), flags=re.IGNORECASE).lower()
+                found = sorted((d for d in original_domains if d.lower() in reply), key=lambda d: reply.index(d.lower()))
+                domains.append(found[0] if found else "Unknown")
 
             except Exception as e:
                 logging.warning(f"LLM failed on row {i}: {e}")
@@ -1042,7 +1097,9 @@ def llm_score_agent(state: CombinedStateDict) -> CombinedStateDict:
         return {"llm_score_output": f"Error: {e}"}
 
 def transliteration_agent(state: CombinedStateDict) -> CombinedStateDict:
-    csv_path = state.get('ground_truth_csv')
+    # the reference transcripts: given in the prompt, else the ones prepare_runs.py put into results/
+    csv_path = state.get('ground_truth_csv') or (state.get('audio_dir') and os.path.join(
+        results_dir(state['audio_dir']), "indicconf_hypothesis-gt.csv"))
     lang_code = state.get('lang_code')
     if not csv_path or not os.path.isfile(csv_path):
         logging.error(f"Invalid ground truth CSV for transliteration: {csv_path}")
@@ -1050,6 +1107,8 @@ def transliteration_agent(state: CombinedStateDict) -> CombinedStateDict:
     if not lang_code:
         logging.error("No language code provided for transliteration")
         return {"transliteration_output": "Error: No language code provided"}
+    if LANG_CODES.get(lang_code) == "English":
+        return {"transliteration_output": "Skipped: English is written in Roman script; nothing to transliterate"}
     logging.info("Running transliteration")
     try:
         result = transliterate_file(csv_path, lang_code, llm=llm)
@@ -1261,8 +1320,8 @@ def keyword_tasks(prompt: str) -> set:
 
 # Hard dependencies between tasks (the same rules the prompts give the LLM), enforced in code so a
 # small local model cannot schedule a task before its inputs exist.
-REFERENCE_TASKS = {9, 16, 23, 24}   # need results/indicconf_hypothesis-gt.csv
-TASK_DEPS = {3: [1], 4: [1], 5: [1], 6: [1], 10: [1], 13: [1], 14: [1], 15: [1], 16: [1], 17: [1],
+REFERENCE_TASKS = {9, 16, 18, 23, 24}   # need results/indicconf_hypothesis-gt.csv
+TASK_DEPS = {3: [1, 8], 4: [1], 5: [1], 6: [1], 10: [1], 13: [1], 14: [1], 15: [1], 16: [1], 17: [1],
              12: [2], 22: [2], 9: [16], 23: [16], 24: [16]}
 
 
@@ -1349,7 +1408,13 @@ def main(user_prompt: str, audio_dir: Optional[str] = None, lang_code: Optional[
     resp_1 = select_tasks(user_prompt)
     
     verified_tasks = prompt_checker_agent(user_prompt, resp_1)
-    tasks = {int(x) for x in verified_tasks.split(',') if x.strip().isdigit() and 1 <= int(x) <= 24}
+    selected = {int(x) for x in resp_1.split(',') if x.strip().isdigit() and 1 <= int(x) <= 24}
+    checked = {int(x) for x in verified_tasks.split(',') if x.strip().isdigit() and 1 <= int(x) <= 24}
+    # the checker may only remove tasks: with qwen3:8b most tasks it added were never requested (planner benchmark:
+    # 29% of planned actions unrequested vs 6% this way); missing tasks come back via keywords and dependencies
+    if checked - selected:
+        logging.info(f"Ignoring tasks added by the prompt checker: {sorted(checked - selected)}")
+    tasks = selected & checked
     named = keyword_tasks(user_prompt) - tasks
     if named:
         logging.info(f"Added tasks named in the prompt but not selected by the LLM: {sorted(named)}")

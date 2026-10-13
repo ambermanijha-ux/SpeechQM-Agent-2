@@ -28,12 +28,14 @@ if os.name == "nt" and not sys.flags.utf8_mode and __name__ == "__main__":
 os.environ.setdefault("PYTHONUTF8", "1")   # inherited by anything run from here
 sys.path.insert(0, str(HERE))
 
+# all 24 checks of the paper (Table 10)
 DEFAULT_CHECKS = ("Perform QC checks for corruption and file extension, sample rate check, audio length, "
                   "VAD silence detection, upsampling, number of speakers, speaker duration, verify if speakers are "
-                  "new or old, IndicLID language identification, verify language as {language}, CTC score, "
-                  "LLM score and check domain")
+                  "new or old, IndicLID language identification, verify language as {language}, transcript quality, "
+                  "character calculation, vocab calculation, CTC score, forced alignment, LLM score and check domain")
 # these compare against reference transcripts, so they run only where transcript JSONs were found
-REFERENCE_CHECKS = ", WER computation, normalization, English word count and utterance duplicate check"
+REFERENCE_CHECKS = (", WER computation, normalization, English word count, transliteration and utterance "
+                    "duplicate check")
 OLLAMA_HELP = {
     "darwin": "install the Ollama app from https://ollama.com/download (or `brew install ollama`), then open it",
     "win32": "install Ollama from https://ollama.com/download (or `winget install Ollama.Ollama`), then start it",
@@ -200,8 +202,8 @@ def main():
         checks = DEFAULT_CHECKS.format(language=language) + (REFERENCE_CHECKS if has_reference else "")
         prompt = (args.prompt or checks) + f" (language: {language})"
         if not has_reference and not args.prompt:
-            print(f"(no reference transcripts for {language}: WER, normalization, English-word and duplicate "
-                  "checks skipped)")
+            print(f"(no reference transcripts for {language}: WER, normalization, English-word, transliteration "
+                  "and duplicate checks skipped)")
         print(f"\n--- {language}: {run / 'audios'}", flush=True)
         t = time.time()
         try:

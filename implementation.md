@@ -63,9 +63,10 @@ text and printing transcripts would fail under the cp1252 code page.
 ```
 prompt ──► select_tasks (LLM) ──► prompt_checker_agent (LLM, ≤ 3 rounds) ──► task set
                                                                                │
+          checker may only remove: task set = selection ∩ checker result
           keyword_tasks: regexes for each check's name add checks the LLM missed
           add_dependencies: TASK_DEPS closure (e.g. WER needs normalization needs ASR)
-          REFERENCE_TASKS {9,16,23,24} dropped when no reference CSV exists
+          REFERENCE_TASKS {9,16,18,23,24} dropped when no reference CSV exists
                                                                                │
           topological_sort_tasks (LLM) → layers; structure_is_valid? else layer_tasks (Kahn layering)
                                                                                │
@@ -76,8 +77,10 @@ prompt ──► select_tasks (LLM) ──► prompt_checker_agent (LLM, ≤ 3 r
 - **Planner prompts** list the 24 checks with keyword rules; the prompt checker compares the selection with the
   user's prompt and returns `Correct` / `Missing` / `Extra` until consistent.
 - The small local LLM is not reliable at this, so the deterministic steps after it guarantee that (a) checks named
-  in the prompt run, (b) dependencies run first, (c) the order is valid. The LLM may still add unrequested checks;
-  they run but do no harm.
+  in the prompt run, (b) dependencies run first, (c) the order is valid. Tasks the prompt checker *adds* are
+  ignored: on an 18-query benchmark (the paper's hallucination rate: planned actions the query did not request)
+  29 % of the planned actions were unrequested when its additions were kept, 6 % with selection ∩ checker, with no
+  requested task missed either way.
 - **State** (`CombinedStateDict`): inputs plus one output key per check (`A` = transcript CSV path, `D` = silence,
   `E` = speakers, `<name>_output` for the others). Nodes return only their own key, so parallel nodes never write
   the same key.
@@ -89,7 +92,8 @@ prompt ──► select_tasks (LLM) ──► prompt_checker_agent (LLM, ≤ 3 r
 
 | Check | Needs |
 |---|---|
-| 3, 4, 5, 6, 10, 13, 14, 15, 16, 17 | 1 (ASR transcript) |
+| 3 | 1 (ASR transcript), 8 (silence, for the speech duration) |
+| 4, 5, 6, 10, 13, 14, 15, 16, 17 | 1 (ASR transcript) |
 | 12, 22 | 2 (speaker table) |
 | 9, 23, 24 | 16 (normalized reference) |
 
@@ -102,22 +106,22 @@ Implementation types: **model** = fixed code around a speech/text model; **code*
 |---|---|---|---|---|
 | 1 | ASR transcription | `indicconf_hypothesis.csv` | model | wav2vec2 CTC per language (section 6.2) |
 | 2 | Speakers and durations | `num_speakers.csv` | model | pyannote or local diarization, global speaker IDs (6.3) |
-| 3 | Transcript quality | `transcript_quality.csv` | code | > 3 words and < 30 % repeated words |
+| 3 | Transcript quality | `transcript_quality.csv` | code | fails: ≤ 3 words, > 20 % repeated 4-word phrases (loops), or < 5 letters per second of speech (ASR dropped speech) |
 | 4 | Characters (graphemes) | `character_list.csv` | agent | |
 | 5 | Vocabulary | `vocab_list.csv` | code | unique words, tags removed |
 | 6 | Script / language verification | `language_verification.csv` | code | share of letters in the language's Unicode block (`config.SCRIPTS`); OK = 100 % |
 | 7 | Audio length | `audio_length.csv` | agent | |
 | 8 | Silence | `vad_silence_stats.csv` | model | duration − detected speech |
 | 9 | English word count | `english_word_count.csv` | code | Latin-script words in the reference |
-| 10 | CTC score | `ctc_scores.csv` | model | forced alignment of the reference (else ASR) transcript (6.4) |
-| 11 | Upsampling | `upsampling_check.csv` | code | energy 4–8 kHz < 2 % of total at 16 kHz → narrowband source |
+| 10 | CTC score | `ctc_scores.csv` | model | forced alignment, per file of the reference if it has one, else the ASR transcript (`Transcript_Source`) (6.4) |
+| 11 | Upsampling | `upsampling_check.csv` | code | stored above 8 kHz with energy 4–8 kHz < 2 % of total, at the file's own rate; native 8 kHz files are not upsampled |
 | 12 | New / old speaker | `valid_speaker.csv` | code | `Old` when any of the file's global speaker IDs (`num_speakers.csv`) appears in another file, listing those files |
-| 13 | Domain | `domain_check.csv` | judge | one label per file |
+| 13 | Domain | `domain_check.csv` | judge | one label per file; reply capped at 30 tokens and must name a listed domain, else `Unknown` |
 | 14 | Forced alignment | `audio_transcript_matching.csv` | agent | script calls `force_alignment_and_ctc_score` with the language's model |
 | 15 | Language identification | `indiclid_language_identification.csv` | model | IndicLID (6.5) |
 | 16 | Normalization (remove tags) | `normalized_list.csv` | agent | removes HTML/XML-style tags from the reference |
 | 17 | LLM score | `llm_scores.csv` | judge | 0–10 coherence/fluency + comment |
-| 18 | Transliteration | `*_transliterated.csv` | model/judge | IndicXlit if installed, else LLM; needs a language code |
+| 18 | Transliteration | `*_transliterated.csv` | model/judge | reference only; IndicXlit if installed, else the LLM maps the Roman words (JSON, batches of 40, answers outside the target script rejected) and only those words are replaced; `roman_words_left`; skipped for English |
 | 19 | Corruption | `corruption_check.csv` | agent | empty, unreadable by soundfile, or `.mp3` → corrupt (SpeechQM rule) |
 | 20 | File extension | `audio_format_check.csv` | agent | `.wav` valid |
 | 21 | Sample rate | `sample_rate_check.csv` | agent | 16 kHz → Pass |
@@ -135,7 +139,7 @@ separators and controls, keeping combining marks. Python's `\w` and `str.isalpha
 task prompt + describe_inputs() (real CSV columns and first row of every CSV the prompt mentions)
    │
    ▼  up to 3 attempts, serialized by AGENT_LOCK
-coder LLM ─► ```python``` block ─► extract_code ─► run_code (fresh namespace, stdout captured,
+coder LLM ─► ```python``` block ─► extract_code ─► fix_paths ─► run_code (fresh namespace, stdout captured,
    ▲                                                 SystemExit caught, short traceback on error)
    │                                                           │
    └── "script failed / file missing / N rows but must be M" ◄─┘  output CSV validated:
@@ -147,8 +151,9 @@ coder LLM ─► ```python``` block ─► extract_code ─► run_code (fresh n
 - On Windows, backslashes in the prompt become `/` so paths survive being pasted into Python string literals.
 - Every script and its output is in `pipeline.log`.
 - Generated code runs in-process with the user's permissions; it is only ever given the task prompts in `llm.py`.
-- Known weakness: the 8B model sometimes mis-copies very long paths (seen with a 120-character temp path); normal
-  dataset paths work.
+- `fix_paths`: the 8B model mis-copies long paths (seen: `…fd5b0e03f1` for `…fd5b0e0303f1` in a 120-character
+  path, three attempts in a row). Any path literal in the script that is ≥ 90 % similar to, but not exactly, a
+  path given in the prompt is replaced by that path (logged as `fixed a miscopied path`).
 
 ## 6. Speech and language models (`utility_functions.py`)
 

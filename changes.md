@@ -107,11 +107,20 @@ with the fallbacks.
 | IndicLID | loaded from hard-coded server paths; BERT checkpoint failed to load under current PyTorch | models in `models/indiclid` (downloaded automatically); checkpoint loaded with its full pickle; works with `fasttext-predict` |
 | State keys | several checks wrote to keys the graph did not declare, so their results were lost | `utterance_duplicate_output`, `wer_output`, `transcript_quality_output` declared |
 | Ground-truth CTC (10) | scored the ASR hypothesis even when a reference existed | prefers the reference CSV |
-| Domain (13) | output contained a "Domain:" prefix | stripped |
+| Domain (13) | output contained a "Domain:" prefix; on a long reference the LLM wrote an essay instead of a label | stripped; reply capped at 30 tokens and must name a listed domain, else `Unknown` |
+| Upsampling (11) | audio was resampled to 16 kHz before the test, so every native 8 kHz file was reported upsampled | measured at the file's own rate; only files stored above 8 kHz can be upsampled |
+| Transcript quality (3) | "unique words < 70 %" failed every long conversation (vocabulary repeats naturally) and missed ASR that dropped most of the speech | fails on ≤ 3 words, looping (> 20 % repeated 4-word phrases) or < 5 letters per second of speech |
+| CTC score (10) | with a reference CSV, files without a reference got no score | per file: reference if present, else ASR (`Transcript_Source`) |
+| Transliteration (18) | never received the reference CSV from `run_qc.py`; asking the LLM to rewrite whole transcripts did not finish (> 14 min); English and Odia rejected | reads `results/indicconf_hypothesis-gt.csv`; LLM maps only Roman words (JSON, validated script); all Indic languages; English skipped |
+| Word splitting (5, 6, 9, 24) | contractions split in two ("don't" → "don", "t"), overcounting English words by ~4 % | apostrophes/hyphens inside a word keep it one word |
+| Code-writing agent | qwen3:8b mis-copied a long path (two characters dropped) in all 3 attempts | `fix_paths` replaces near-miss path literals with the real path |
+| Prompt checker | added unrequested tasks (29 % of planned actions on an 18-query benchmark) | its additions are ignored; it can only remove (6 %) |
 
 ## 7. Unchanged on purpose
 
 - The 24 checks, their numbering and the LangGraph orchestration (planner → prompt checker → DAG → parallel execution).
+  The default run (`run_qc.py` without `--prompt`) requests all 24 (18 needs reference transcripts and an Indic
+  language; 9, 16, 23, 24 need reference transcripts).
 - SpeechQM's file rules: only `.wav` passes the extension check and `.mp3` is reported as corrupt; 16 kHz is the
   expected sample rate.
 - Output CSV names and columns of each check (some gained columns, none lost).

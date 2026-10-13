@@ -64,7 +64,8 @@ def transliterate_file(file_path: str, lang_code: str, llm=None) -> str:
     """Roman -> native script. Uses AI4Bharat IndicXlit when installed (needs fairseq, which does not
     build on Apple Silicon); otherwise asks the local LLM."""
     try:
-        supported_langs = {'bn', 'gu', 'hi', 'kn', 'ml', 'mr', 'pa', 'sd', 'si', 'ta', 'te', 'ur'}
+        from config import LANG_CODES
+        supported_langs = {c for c, name in LANG_CODES.items() if name != "English"}
         if lang_code not in supported_langs:
             raise ValueError(f"Unsupported language code: {lang_code}. Supported codes: {', '.join(supported_langs)}")
         if not os.path.exists(file_path):
@@ -85,12 +86,37 @@ def transliterate_file(file_path: str, lang_code: str, llm=None) -> str:
             if llm is None:
                 raise RuntimeError("IndicXlit is not installed and no LLM was given for transliteration")
             logging.info("IndicXlit not installed; transliterating with the local LLM")
+            from config import LANG_CODES, SCRIPTS
+            language = LANG_CODES[lang_code]
+            script, lo, hi = SCRIPTS[language]
+            bounded = llm.model_copy(update={"num_predict": 1500})   # an unbounded reply can loop for minutes
+            mapping = {}
+
+            def learn(batch):
+                """Ask for a JSON word map for a batch of Roman-script words; keep only answers in the target
+                script, so the model cannot rewrite, drop or invent anything else in the transcript."""
+                prompt = (f"Transliterate each romanized word into {language} ({script} script), as it would be "
+                          f"written in {language}. Do not translate. Reply with only a JSON object mapping each "
+                          f"given word to its transliteration.\nWords: {json.dumps(batch)}")
+                reply = bounded.invoke(prompt).content
+                m = re.search(r"\{.*\}", reply, re.DOTALL)
+                try:
+                    got = json.loads(m.group(0)) if m else {}
+                except json.JSONDecodeError:
+                    got = {}
+                for w in batch:
+                    v = str(got.get(w, "")).strip()
+                    if v and all(lo <= ord(ch) <= hi or ch in " \u200c\u200d" for ch in v):
+                        mapping[w] = v
 
             def translit(text):
-                prompt = (f"Transliterate the following romanized text into the native script of the language with ISO code "
-                          f"'{lang_code}'. Keep words that are already in native script unchanged. Do not translate. "
-                          f"Return only the transliterated text.\nText: {text}")
-                return llm.invoke(prompt).content.strip()
+                # [tags] and <tags> are matched first and kept as they are
+                token = r"\[[^\]]*\]|<[^>]*>|[A-Za-z][A-Za-z'-]*"
+                roman = [w for w in dict.fromkeys(re.findall(token, str(text)))
+                         if w[0] not in "[<" and w not in mapping]
+                for i in range(0, len(roman), 40):
+                    learn(roman[i:i + 40])
+                return re.sub(token, lambda m: mapping.get(m.group(0), m.group(0)), str(text))
 
         def transliterate(text):
             if pd.isna(text) or str(text).strip() == "":
@@ -101,6 +127,9 @@ def transliterate_file(file_path: str, lang_code: str, llm=None) -> str:
                 print(f"Error transliterating '{text}': {e}")
                 return text
         df["ground_truth_transliterated"] = df["ground_truth"].apply(transliterate)
+        # Roman-script words left untransliterated (not mapped, or the model's answer was rejected)
+        df["roman_words_left"] = df["ground_truth_transliterated"].fillna("").astype(str).apply(
+            lambda t: len(re.findall(r"[A-Za-z][A-Za-z'-]*", re.sub(r"\[[^\]]*\]|<[^>]*>", " ", t))))
         base, ext = os.path.splitext(file_path)
         output_path = f"{base}_transliterated.csv"
         df.to_csv(output_path, index=False, encoding='utf-8')
@@ -422,13 +451,24 @@ def save_num_speakers(folder_path: str) -> str:
         return f"Error writing to CSV: {e}"
 
 
-def transcript_quality(transcript):
-    words = transcript.strip().split()
-    repeated = len(set(words)) < len(words) * 0.7
-    if len(words) > 3 and not repeated:
-        return "passed"
-    else:
-        return "failed"
+def transcript_quality(transcript, speech_seconds=None, min_chars_per_s=5.0, max_repeat=0.2):
+    """'passed', or 'failed: <reason>'. Checks that the transcript has content, does not loop (share of repeated
+    word 4-grams; ASR/LLM loops repeat whole phrases) and, when the speech duration is known, that it is not far too
+    short for it (fluent speech is ~10-20 letters/s in Indic scripts and English; ASR that drops speech gives far fewer).
+    The original rule (unique words < 70% of all words) failed every long conversation, since vocabulary
+    repeats naturally over minutes of speech."""
+    words = str(transcript).split()
+    if len(words) <= 3:
+        return "failed: (almost) empty"
+    grams = [tuple(words[i:i + 4]) for i in range(len(words) - 3)]
+    repeat = 1 - len(set(grams)) / len(grams) if grams else 0.0
+    if repeat > max_repeat:
+        return f"failed: repetitive ({repeat:.0%} repeated 4-word phrases)"
+    if speech_seconds:
+        rate = len("".join(words)) / speech_seconds
+        if rate < min_chars_per_s:
+            return f"failed: too little text for the speech ({rate:.1f} letters/s)"
+    return "passed"
 
 
 # ---------------------------------------------------------------- forced alignment / CTC score
@@ -595,14 +635,19 @@ def process_audio_directory(audio_dir, transcript_csv, output_csv_path=None, lan
 
 # ---------------------------------------------------------------- upsampling
 def is_upsampled_from_8k_v2(audio_path, threshold_ratio=0.02):
+    """True if a file stored above 8 kHz carries (almost) no energy between 4 and 8 kHz, i.e. narrowband audio
+    upsampled to a higher rate. Measured at the file's own rate: a native 8 kHz file is not upsampled (the sample
+    rate check reports it), and resampling it to 16 kHz first would make every such file look upsampled."""
     try:
-        waveform = load_audio(audio_path)
+        waveform, native_sr = librosa.load(audio_path, sr=None, mono=True)
     except Exception as e:
         print(f"Encountered an error loading file {audio_path}")
         print(f"ERROR: {e}")
         return False
+    if native_sr <= 8000:
+        return False
     spectrum = np.abs(np.fft.rfft(waveform))
-    freqs = np.fft.rfftfreq(len(waveform), 1 / SR)
+    freqs = np.fft.rfftfreq(len(waveform), 1 / native_sr)
     total_energy = np.sum(spectrum)
     high_freq_band = (freqs >= 4000) & (freqs <= 8000)
     high_freq_energy = np.sum(spectrum[high_freq_band])

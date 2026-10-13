@@ -116,8 +116,8 @@ Malayalam (Malyalam), Punjabi, Urdu, Assamese, Nepali, Sanskrit, English. Upper/
 {"language_code": "hin",
  "segments": [{"text": "नमस्ते", "start_time": 0.1, "end_time": 1.2, "speaker": {"id": "speaker_0"}}]}
 ```
-With references you also get WER, CTC against the reference, tag normalization, English-word count and duplicate
-checks. Without them these checks are skipped (CTC then scores the ASR transcript).
+With references you also get WER, CTC against the reference, tag normalization, English-word count,
+transliteration (Roman → native script) and duplicate checks. Without them these checks are skipped (CTC then scores the ASR transcript).
 
 Your audio folder is never modified: files are copied into the results folder before processing.
 
@@ -143,21 +143,29 @@ audio_qc/
 | Corruption | `valid` / `corrupt` (unreadable, empty, or `.mp3`: the SpeechQM spec accepts WAV only) | `corrupt` |
 | Valid_Extension | `.wav` | `False` |
 | Sample_Rate, Sample_Rate_Status | Hz; Pass = 16 kHz | `Fail` |
-| Upsampled | `True` = almost no energy above 4 kHz: narrowband (8 kHz / phone) audio, possibly stored at a higher rate | `True` |
+| Upsampled | `True` = stored above 8 kHz but almost no energy above 4 kHz: narrowband (phone) audio upsampled to a higher rate. 8 kHz files are `False` (see Sample_Rate) | `True` |
 | Silence_s | seconds without speech | high share of Duration_s |
 | Speakers, Speaker_Durations_h | number of speakers and talk time per speaker in hours; speaker IDs are shared across files | unexpected count |
 | Speaker_New_Old, Shares_Speaker_With | `Old` = a voice in this file also speaks in the listed file(s) | `Old` where every speaker should be unique |
 | Detected_Language, LID_Confidence | IndicLID language of the ASR transcript | not the folder's language |
 | Script_Share, Script_OK | share of letters in the language's script | `False` |
-| CTC_Score, CTC_Status | how well the reference (or ASR) transcript aligns with the audio, 0-1; Good > 0.7, Medium > 0.5 | `Poor` |
+| ASR_Transcript_Quality | `passed`, or `failed:` with the reason (almost empty, looping, or far too little text for the speech: the ASR model dropped speech) | `failed` |
+| CTC_Score, CTC_Status, CTC_Scored_Text | how well the transcript aligns with the audio, 0-1; Good > 0.7, Medium > 0.5; the file's reference if it has one, else the ASR transcript | `Poor` |
+| ASR_Alignment_Score | forced-alignment score of the ASR transcript (task 14). High even when the ASR left out speech: it scores the text that is there | |
 | LLM_Score | 0-10 fluency/coherence of the ASR transcript judged by the local LLM | low |
 | Domain | topic (Healthcare, Insurance, Finance, Sales, Daily Life, ...) | unexpected topic |
 | WER | word error rate of ASR vs reference (needs reference) | |
 | English_Words_in_Reference | Latin-script words in the reference transcript | |
+| Roman_Words_Left_After_Transliteration | Roman-script words the transliteration could not convert | |
 
 **Reading WER:** the ASR writes everything in the language's own script, while many references write English words
 in Latin script ("Hospital", "insurance"). Every such word counts as an error, so WER is high on code-mixed speech
 even when recognition is good. Compare WER between files and vendors rather than against an absolute target.
+
+**Reading LLM_Score and Domain:** both are judged from the ASR transcript. With a weak ASR model the transcript is
+close to word salad: in our tests the judge gave the ASR text and the same words in random order the same score
+(about 3), while human reference transcripts scored about 6.5. Low scores therefore say "the ASR output is poor"
+more than "the speech is poor", and the domain is less reliable for such files (check ASR_Transcript_Quality).
 
 ## 7. Models used
 

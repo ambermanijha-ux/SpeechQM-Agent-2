@@ -19,10 +19,13 @@ COLUMNS = {
     "indiclid_language_identification.csv": {"Language_Code": "Detected_Language", "Confidence": "LID_Confidence"},
     "language_verification.csv": {"*_Share": "Script_Share", "Is_*": "Script_OK"},
     "wer.csv": {"WER": "WER"},
-    "ctc_scores.csv": {"CTC_Score": "CTC_Score", "CTC_Status": "CTC_Status"},
+    "transcript_quality.csv": {"Quality_Check": "ASR_Transcript_Quality"},
+    "ctc_scores.csv": {"CTC_Score": "CTC_Score", "CTC_Status": "CTC_Status", "Transcript_Source": "CTC_Scored_Text"},
+    "audio_transcript_matching.csv": {"CTC_Score": "ASR_Alignment_Score"},
     "llm_scores.csv": {"LLM_Score": "LLM_Score"},
     "domain_check.csv": {"domain": "Domain"},
     "english_word_count.csv": {"english_word_count": "English_Words_in_Reference"},
+    "indicconf_hypothesis-gt_transliterated.csv": {"roman_words_left": "Roman_Words_Left_After_Transliteration"},
 }
 
 
