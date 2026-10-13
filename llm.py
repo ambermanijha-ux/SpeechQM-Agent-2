@@ -800,25 +800,17 @@ def valid_speaker_agent(state: CombinedStateDict) -> CombinedStateDict:
     res = results_dir(audio_dir)
     input_path = os.path.join(res, "num_speakers.csv")
     output_path = os.path.join(res, "valid_speaker.csv")
-    task_prompt = f"""You are given a CSV file at this path: {input_path}.
-    The CSV has columns 'File Name', 'Number of Speakers', and 'Speaker Durations', where 'Speaker Durations' is a JSON string mapping speaker IDs to their speaking durations in hours.
-    Speaker IDs are global: the same ID in two files means the same voice.
-    Write a Python script to:
-    1. Load the CSV file.
-    2. Create a dictionary to count how many files each speaker ID appears in.
-    3. For each file in the CSV:
-    - If 'Number of Speakers' is 'Error', skip that row.
-    - If any of the file's speaker IDs appears in more than one file, set Speaker_Status to 'Old' and Common_File to a ';'-joined list of the OTHER files containing that speaker.
-    - Otherwise, set Speaker_Status to 'New' and Common_File to an empty string.
-    4. Create a new CSV with columns: 'Filename', 'Speaker_Status', 'Common_File', with one row for EVERY file (New and Old).
-    5. Save the CSV at exactly this path: {output_path}
-    6. Handle errors gracefully.
-    """
+    # deterministic: the model-written scripts for this simple join failed on real data (column handling)
     try:
-        if run_agent(task_prompt, output_path, csv_rows(input_path, skip_error=True)):
-            return {"valid_speaker_output": f"CSV saved at: {output_path}"}
-        logging.error(f"Valid speaker check failed to generate {output_path}")
-        return {"valid_speaker_output": f"Error: Failed to generate {output_path}"}
+        df = pd.read_csv(input_path)
+        df = df[df["Number of Speakers"].astype(str) != "Error"]
+        speakers = {str(f): set(json.loads(d)) for f, d in zip(df["File Name"], df["Speaker Durations"])}
+        rows = []
+        for f, ids in speakers.items():
+            others = [g for g, other in speakers.items() if g != f and ids & other]
+            rows.append({"Filename": f, "Speaker_Status": "Old" if others else "New", "Common_File": ";".join(others)})
+        pd.DataFrame(rows, columns=["Filename", "Speaker_Status", "Common_File"]).to_csv(output_path, index=False)
+        return {"valid_speaker_output": f"CSV saved at: {output_path}"}
     except Exception as e:
         logging.error(f"Valid speaker check failed: {e}")
         return {"valid_speaker_output": f"Error: {e}"}

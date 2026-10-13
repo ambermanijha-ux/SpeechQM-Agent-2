@@ -111,7 +111,7 @@ Implementation types: **model** = fixed code around a speech/text model; **code*
 | 9 | English word count | `english_word_count.csv` | code | Latin-script words in the reference |
 | 10 | CTC score | `ctc_scores.csv` | model | forced alignment of the reference (else ASR) transcript (6.4) |
 | 11 | Upsampling | `upsampling_check.csv` | code | energy 4–8 kHz < 2 % of total at 16 kHz → narrowband source |
-| 12 | New / old speaker | `valid_speaker.csv` | agent | from global speaker IDs in `num_speakers.csv` |
+| 12 | New / old speaker | `valid_speaker.csv` | code | `Old` when any of the file's global speaker IDs (`num_speakers.csv`) appears in another file, listing those files |
 | 13 | Domain | `domain_check.csv` | judge | one label per file |
 | 14 | Forced alignment | `audio_transcript_matching.csv` | agent | script calls `force_alignment_and_ctc_score` with the language's model |
 | 15 | Language identification | `indiclid_language_identification.csv` | model | IndicLID (6.5) |
@@ -143,7 +143,7 @@ coder LLM ─► ```python``` block ─► extract_code ─► run_code (fresh n
 ```
 
 - **Expected rows**: one per file for file checks (19, 20 all files; 7, 21 audio files), one per input row for
-  transcript checks, one per file with speakers for 12. A script that silently skips files is sent back.
+  transcript checks. A script that silently skips files is sent back.
 - On Windows, backslashes in the prompt become `/` so paths survive being pasted into Python string literals.
 - Every script and its output is in `pipeline.log`.
 - Generated code runs in-process with the user's permissions; it is only ever given the task prompts in `llm.py`.

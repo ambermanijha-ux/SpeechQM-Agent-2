@@ -628,10 +628,11 @@ implemented, are tabulated in `implementation.md` §4; the groups are:
 - **Fixed code around a model** (1 ASR, 2 speakers, 8 silence, 10 CTC, 15 IndicLID): call functions in
   `utility_functions.py`.
 - **Fixed Python** (3 transcript quality, 5 vocabulary, 6 script check, 9 English words, 11 upsampling,
+  12 new/old speaker,
   22 speaker hours, 23 duplicates, 24 WER): deterministic, same result every run.
 - **LLM judge** (13 domain, 17 fluency score): the LLM reads each transcript and answers; the reply is parsed
   with a regex (`Score: 7` → 7).
-- **Code-writing agent** (4 characters, 7 length, 12 new/old speaker, 14 forced alignment, 16 normalization,
+- **Code-writing agent** (4 characters, 7 length, 14 forced alignment, 16 normalization,
   19 corruption, 20 extension, 21 sample rate): the LLM writes a Python script, see below.
 
 ### 11.4 The code-writing agent (`run_agent`)
