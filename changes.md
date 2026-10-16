@@ -118,6 +118,7 @@ with the fallbacks.
 | Code-writing agent | qwen3:8b mis-copied a long path (two characters dropped) in all 3 attempts | `fix_paths` replaces near-miss path literals with the real path |
 | Prompt checker | added unrequested tasks (29 % of planned actions on an 18-query benchmark) | its additions are ignored; it can only remove (6 %) |
 | LLM score (17) | the judge gave ASR transcripts and the same words shuffled the same score | gated: scored only when transcript quality passes, ASR alignment ≥ 0.5 and IndicBERTv2 pseudo-perplexity ≤ 150 (calibrated: human references 10-53, shuffled 397-1512); otherwise empty with the reason |
+| LLM judge (17) | the planner model judged the pipeline's own output, with no check that it can tell good text from bad | separate `JUDGE_MODEL` / `JUDGE_BASE_URL` (e.g. Llama 3.3 70B on a GPU server); every file is also judged shuffled and, if available, as the reference; the score is reported only when the judge ranks them correctly (`Judge_Check`) |
 | Transliteration (18) | one LLM answer per word could be wrong but plausible | converted only when two differently worded LLM runs agree and, when available, IndicXlit lists the same spelling in its top 5 (`docker/indicxlit` for Mac/Windows); per-word decisions in `transliteration_words.csv` |
 
 ## 7. Unchanged on purpose

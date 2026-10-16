@@ -121,7 +121,7 @@ Implementation types: **model** = fixed code around a speech/text model; **code*
 | 14 | Forced alignment | `audio_transcript_matching.csv` | agent | script calls `force_alignment_and_ctc_score` with the language's model |
 | 15 | Language identification | `indiclid_language_identification.csv` | model | IndicLID (6.5) |
 | 16 | Normalization (remove tags) | `normalized_list.csv` | agent | removes HTML/XML-style tags from the reference |
-| 17 | LLM score | `llm_scores.csv` | judge (gated) | perplexity (`pseudo_perplexity`, IndicBERTv2), alignment (task 14) and quality (task 3) for every file; the LLM's 0–10 score only when all pass (`FLUENCY_MAX_PPL` 150, `FLUENCY_MIN_ALIGN` 0.5) |
+| 17 | LLM score | `llm_scores.csv` | judge (gated) | perplexity (`pseudo_perplexity`, IndicBERTv2), alignment (task 14) and quality (task 3) for every file; the judge (`JUDGE_MODEL`) also scores a shuffled copy and the reference; `LLM_Score` only when all pass and reference ≥ transcript > shuffled (`FLUENCY_MAX_PPL` 150, `FLUENCY_MIN_ALIGN` 0.5) |
 | 18 | Transliteration | `*_transliterated.csv`, `transliteration_words.csv` | model + judge | reference only; a Roman word is replaced only when two LLM runs (different prompts, JSON, batches of 40) agree, the answer is in the script and, if IndicXlit is available (installed or the `speechqm-indicxlit` Docker image), it is in IndicXlit's top 5; skipped for English |
 | 19 | Corruption | `corruption_check.csv` | agent | empty, unreadable by soundfile, or `.mp3` → corrupt (SpeechQM rule) |
 | 20 | File extension | `audio_format_check.csv` | agent | `.wav` valid |
@@ -231,6 +231,7 @@ qwen3 so replies contain only the answer. The planner and coder are the same `qw
 | Setting | Default | Env var |
 |---|---|---|
 | Planner / coder LLM | `qwen3:8b` | `PLANNER_MODEL`, `CODER_MODEL` |
+| Judge LLM (17) and its server | planner model, same server | `JUDGE_MODEL`, `JUDGE_BASE_URL` |
 | Ollama server | `http://localhost:11434` | `OLLAMA_BASE_URL` |
 | LLM context | 8192 | `LLM_NUM_CTX` |
 | Speech backend | `pyannote` | `SPEECH_BACKEND` (`local`) |

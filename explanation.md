@@ -556,8 +556,10 @@ Every value can be overridden by an environment variable of the same name, e.g. 
 |---|---|---|
 | `MODELS_DIR`, `INDICLID_DIR` | `models/`, `models/indiclid/` | where non-Hugging-Face models are stored |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | the Ollama server's address (point it elsewhere to use another machine's GPU) |
-| `PLANNER_MODEL` | `qwen3:8b` | LLM for task selection, checking, ordering, domain and fluency scoring |
+| `PLANNER_MODEL` | `qwen3:8b` | LLM for task selection, checking, ordering and domain |
 | `CODER_MODEL` | `qwen3:8b` | LLM that writes the Python scripts for some checks |
+| `JUDGE_MODEL` | same as `PLANNER_MODEL` | LLM that gives the fluency score (task 17) |
+| `JUDGE_BASE_URL` | same as `OLLAMA_BASE_URL` | the judge's Ollama server (e.g. a GPU machine through an SSH tunnel) |
 | `LLM_NUM_CTX` | 8192 | how many tokens of context the LLM gets |
 | `ASR_MODELS` | 15 languages | per language, a list of ASR models tried in order |
 | `DEFAULT_LANGUAGE` | Hindi | when nothing names a language |
@@ -634,7 +636,9 @@ implemented, are tabulated in `implementation.md` §4; the groups are:
 - **LLM judge** (13 domain, 17 fluency score): the LLM reads each transcript and answers; the reply is parsed
   with a regex (`Score: 7` → 7). The fluency score is gated: `pseudo_perplexity` (IndicBERTv2 masks a sample of up
   to 400 tokens one at a time and averages how surprised it is), the ASR alignment score and transcript quality
-  are measured first, and only transcripts passing all three are sent to the LLM.
+  are measured first. The judge (`JUDGE_MODEL`) scores the transcript, the same words shuffled (fixed seed) and the
+  reference if there is one; `LLM_Score` is kept only when the gate passed and the judge ranked
+  reference >= transcript > shuffled (`Judge_Check`).
 - **Code-writing agent** (4 characters, 7 length, 14 forced alignment, 16 normalization,
   19 corruption, 20 extension, 21 sample rate): the LLM writes a Python script, see below.
 

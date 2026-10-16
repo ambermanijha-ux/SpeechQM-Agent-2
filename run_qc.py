@@ -131,6 +131,13 @@ def check_ollama():
             sys.exit(f"Ollama is not running at {OLLAMA_BASE_URL}. "
                      f"{OLLAMA_HELP.get(sys.platform, OLLAMA_HELP['linux'])}")
     ensure_ollama()
+    from config import JUDGE_MODEL, JUDGE_BASE_URL
+    try:
+        ensure_ollama((JUDGE_MODEL,), JUDGE_BASE_URL)
+    except OSError:
+        sys.exit(f"The judge's Ollama is not reachable at {JUDGE_BASE_URL} (JUDGE_BASE_URL); "
+                 f"start it or its SSH tunnel, or unset JUDGE_BASE_URL to use {OLLAMA_BASE_URL}.")
+    print(f"LLM judge (task 17): {JUDGE_MODEL} at {JUDGE_BASE_URL}")
 
 
 def clear_results(run: Path):

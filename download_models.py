@@ -39,19 +39,19 @@ def has_access(repo: str) -> bool:
         return False
 
 
-def ollama_models() -> list:
+def ollama_models(base_url=OLLAMA_BASE_URL) -> list:
     """Models present in the Ollama server; raises OSError if the server is not reachable."""
-    with urllib.request.urlopen(f"{OLLAMA_BASE_URL}/api/tags", timeout=5) as r:
+    with urllib.request.urlopen(f"{base_url}/api/tags", timeout=5) as r:
         return [m["name"] for m in json.load(r)["models"]]
 
 
-def ensure_ollama(models=(PLANNER_MODEL, CODER_MODEL)):
-    have = ollama_models()
+def ensure_ollama(models=(PLANNER_MODEL, CODER_MODEL), base_url=OLLAMA_BASE_URL):
+    have = ollama_models(base_url)
     for m in dict.fromkeys(models):
         if m in have or f"{m}:latest" in have:
             continue
-        print(f"ollama: pulling {m} (one-time download, ~5 GB)")
-        req = urllib.request.Request(f"{OLLAMA_BASE_URL}/api/pull", data=json.dumps({"model": m}).encode(),
+        print(f"ollama: pulling {m} at {base_url} (one-time download)")
+        req = urllib.request.Request(f"{base_url}/api/pull", data=json.dumps({"model": m}).encode(),
                                      headers={"Content-Type": "application/json"})
         last = ""
         with urllib.request.urlopen(req) as r:

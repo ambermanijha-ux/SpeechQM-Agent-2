@@ -154,7 +154,10 @@ audio_qc/
 | ASR_Alignment_Score | forced-alignment score of the ASR transcript (task 14). High even when the ASR left out speech: it scores the text that is there | |
 | LM_Perplexity | how predictable the ASR transcript is to a language model (IndicBERTv2); human transcripts measure ~10-50, shuffled words ~400-1500 | > 150 |
 | Fluency_Gate | `passed`, or `failed:` with the reasons (transcript quality, alignment < 0.5, perplexity > 150) | `failed` |
-| LLM_Score | 0-10 fluency/coherence judged by the local LLM, only for transcripts that pass Fluency_Gate (empty otherwise) | low |
+| Judge_Model | the LLM that judged task 17 (`JUDGE_MODEL`) | |
+| Judge_Score_Transcript, Judge_Score_Shuffled, Judge_Score_Reference | the judge's raw 0-10 scores of the ASR transcript, of the same words shuffled, and of the human reference (if any) | |
+| Judge_Check | `passed` when the judge ranks reference >= transcript > shuffled, else `failed:` with what it got wrong | `failed` |
+| LLM_Score | 0-10 fluency/coherence, only when Fluency_Gate and Judge_Check both pass (empty otherwise) | low |
 | Domain | topic (Healthcare, Insurance, Finance, Sales, Daily Life, ...) | unexpected topic |
 | WER | word error rate of ASR vs reference (needs reference) | |
 | English_Words_in_Reference | Latin-script words in the reference transcript | |
@@ -167,7 +170,8 @@ even when recognition is good. Compare WER between files and vendors rather than
 **Reading LLM_Score and Domain:** both are judged from the ASR transcript. With a weak ASR model the transcript is
 close to word salad, and an LLM judge cannot tell it from the same words shuffled (we tested: both scored about 3,
 human transcripts about 6.5). So the LLM only scores transcripts that pass measured checks first (Fluency_Gate);
-for the rest LLM_Score is empty and the measured values say why. The domain is less reliable for files that fail
+for the rest LLM_Score is empty and the measured values say why. The judge also scores a shuffled copy and the
+reference of every file; if it cannot rank them correctly, its score is not reported either (Judge_Check). The domain is less reliable for files that fail
 the gate.
 
 ## 7. Models used
@@ -213,6 +217,9 @@ transcripts; 8 kHz phone recordings transcribe worse than 16 kHz recordings.
 
 - **Settings** are in `config.py`; any model can be overridden with an environment variable of the same name
   (`PLANNER_MODEL`, `CODER_MODEL`, `OLLAMA_BASE_URL` for an Ollama server on another machine,
+  `JUDGE_MODEL` / `JUDGE_BASE_URL` for a separate judge model, possibly on another machine — e.g. Llama 3.3 70B on a
+  GPU server: `ssh -N -L 11435:localhost:11434 <server>` then
+  `JUDGE_MODEL=llama3.3:70b-instruct-q8_0 JUDGE_BASE_URL=http://localhost:11435 ./run.sh ...`,
   `SPEECH_BACKEND=local`, `SPEAKER_MATCH_THRESHOLD`, `DEFAULT_LANGUAGE`).
 - **Original prompt-driven mode:** write a prompt containing an absolute folder path into `my_secrets.py`
   (`PROMPT = "Check sample rate and count speakers in '/data/hindi/audios'"`) and run `.venv/bin/python llm.py`.

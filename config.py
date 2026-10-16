@@ -11,6 +11,11 @@ OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
 PLANNER_MODEL = os.environ.get("PLANNER_MODEL", "qwen3:8b")   # task selection, DAG, domain, judge (best of qwen2.5 7b/14b, qwen3 8b on task selection)
 CODER_MODEL = os.environ.get("CODER_MODEL", "qwen3:8b")   # writes + repairs the per-task Python scripts (9/9 vs 2/9 for qwen2.5-coder:7b)
 LLM_NUM_CTX = int(os.environ.get("LLM_NUM_CTX", "8192"))
+# LLM-as-a-judge of task 17 (fluency score), kept apart from the planner so a model is not grading its own pipeline.
+# It can be served by another Ollama, e.g. a GPU machine through `ssh -N -L 11435:localhost:11434 <host>` and
+# JUDGE_BASE_URL=http://localhost:11435 (Llama 3.3 70B needs ~43 GB at 4-bit, ~75 GB at 8-bit).
+JUDGE_MODEL = os.environ.get("JUDGE_MODEL", PLANNER_MODEL)
+JUDGE_BASE_URL = os.environ.get("JUDGE_BASE_URL", OLLAMA_BASE_URL)
 
 # Speech models. The ai4bharat ones are gated: accept their terms on Hugging Face and log in
 # (`.venv/bin/hf auth login`) before running download_models.py.

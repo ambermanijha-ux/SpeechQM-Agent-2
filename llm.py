@@ -33,18 +33,19 @@ from utility_functions import (
 )
 import librosa
 import pandas as pd
-from config import (OLLAMA_BASE_URL, PLANNER_MODEL, CODER_MODEL, LLM_NUM_CTX, LANG_CODES, DEFAULT_LANGUAGE, SCRIPTS,
+from config import (OLLAMA_BASE_URL, PLANNER_MODEL, CODER_MODEL, JUDGE_MODEL, JUDGE_BASE_URL, LLM_NUM_CTX, LANG_CODES, DEFAULT_LANGUAGE, SCRIPTS,
                     FLUENCY_MAX_PPL, FLUENCY_MIN_ALIGN)
 logging.basicConfig(filename="pipeline.log", level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 # Local LLMs through Ollama (originally gpt-4.1-mini via the OpenAI API)
-def local_llm(model):
+def local_llm(model, base_url=OLLAMA_BASE_URL):
     # thinking models (qwen3, deepseek-r1) would put reasoning text, full of numbers, into the answers we parse
     thinking = {"reasoning": False} if any(k in model for k in ("qwen3", "deepseek-r1")) else {}
-    return ChatOllama(model=model, base_url=OLLAMA_BASE_URL, temperature=0, num_ctx=LLM_NUM_CTX, **thinking)
+    return ChatOllama(model=model, base_url=base_url, temperature=0, num_ctx=LLM_NUM_CTX, **thinking)
 
 
 llm = local_llm(PLANNER_MODEL)
 coder_llm = local_llm(CODER_MODEL)
+judge_llm = local_llm(JUDGE_MODEL, JUDGE_BASE_URL)
 
 
 def results_dir(audio_dir: str) -> str:
@@ -1057,16 +1058,50 @@ def normalization_remove_tags_agent(state: CombinedStateDict) -> CombinedStateDi
         logging.error(f"Normalization failed: {e}")
         return {"normalization_remove_tags_output": f"Error: {e}"}
 
+def judge_score(text: str, language: str):
+    """One 0-10 fluency/coherence score from the judge model: (score or None, comment)."""
+    prompt = f"""You are a strict judge of {language} speech transcriptions.
+    Evaluate the coherence and fluency of this transcription. Understand the meaning before scoring; do not give every transcription the same score.
+    Score from 0 to 10: 10 for fluent, meaningful sentences, lower the more meaningless it gets, and 0 if it is in a language other than {language}.
+    Reply in exactly this format:
+    Score: <0-10>
+    Comment: <one sentence>
+    Transcription: {text[:4000]}"""
+    for attempt in range(3):   # a judge on another machine can drop out for a moment (SSH tunnel, VPN)
+        try:
+            out = judge_llm.model_copy(update={"num_predict": 200}).invoke(prompt).content
+            break
+        except Exception as e:
+            logging.warning(f"LLM judge ({JUDGE_MODEL} at {JUDGE_BASE_URL}) failed: {e}")
+            if attempt == 2:
+                return None, f"Error: judge unreachable ({e})"
+            time.sleep(10)
+    m = re.search(r'Score:\s*(\d+(?:\.\d+)?)', out)
+    c = re.search(r'Comment:\s*(.*)', out, re.DOTALL)
+    return (min(10.0, float(m.group(1))) if m else None), (c.group(1).strip() if c else "Error: reply had no score")
+
+
+def shuffled(text: str) -> str:
+    """The same words in a fixed random order: a control the judge must score lower than the real text."""
+    import random
+    w = text.split()
+    random.Random(0).shuffle(w)
+    return " ".join(w)
+
+
 def llm_score_agent(state: CombinedStateDict) -> CombinedStateDict:
-    """LLM-as-a-judge, gated by measured signals. Every file gets three numbers that cannot be hallucinated:
-    transcript quality (task 3), CTC alignment of the ASR transcript (task 14, else computed here) and the language
-    model's pseudo-perplexity. Only transcripts that pass all three are scored 0-10 by the LLM; on the others the
-    judge cannot tell the transcript from shuffled words (tested), so LLM_Score stays empty with the reason."""
+    """LLM-as-a-judge (JUDGE_MODEL), gated by measured signals and checked with controls.
+    Gate: every file gets three numbers that cannot be hallucinated: transcript quality (task 3), CTC alignment of
+    the ASR transcript (task 14, else computed here) and the language model's pseudo-perplexity.
+    Controls: the judge also scores the same words shuffled and, where there is one, the human reference. A judge
+    that cannot rank reference >= transcript > shuffled is not measuring fluency on that file.
+    LLM_Score is the judge's score of the transcript only when the gate and the controls both pass; otherwise it
+    stays empty with the reason. The raw judge scores are kept in their own columns."""
     audio_dir = state.get('audio_dir')
     if not audio_dir or not os.path.isdir(audio_dir):
         logging.error(f"Invalid audio directory for LLM score: {audio_dir}")
         return {"llm_score_output": "Error: Invalid audio directory"}
-    logging.info("Running LLM score evaluation")
+    logging.info(f"Running LLM score evaluation (judge {JUDGE_MODEL})")
     res = results_dir(audio_dir)
     csv_path = state.get('A', os.path.join(res, "indicconf_hypothesis.csv"))
     if not os.path.isfile(csv_path):
@@ -1083,12 +1118,14 @@ def llm_score_agent(state: CombinedStateDict) -> CombinedStateDict:
             return dict(zip(d[key].astype(str), d[value])) if {key, value} <= set(d.columns) else {}
         quality = column("transcript_quality.csv", fcol, "Quality_Check")
         align = column("audio_transcript_matching.csv", "Filename", "CTC_Score")
+        reference = column("indicconf_hypothesis-gt.csv", "filename", "ground_truth")
+        language = language_of(state)
         rows = []
         for fname, text in zip(df[fcol].astype(str), df[tcol].fillna("").astype(str)):
             if fname not in align or pd.isna(align[fname]):   # task 14 missing or failed: align here
                 try:
                     align[fname] = force_alignment_and_ctc_score(os.path.join(audio_dir, fname), text,
-                                                                 align_model_for(language_of(state)))[1]
+                                                                 align_model_for(language))[1]
                 except Exception as e:
                     logging.warning(f"alignment for the fluency gate failed on {fname}: {e}")
                     align[fname] = None
@@ -1100,27 +1137,30 @@ def llm_score_agent(state: CombinedStateDict) -> CombinedStateDict:
                 reasons.append(f"alignment {align[fname] if align[fname] is None else round(float(align[fname]), 2)} < {FLUENCY_MIN_ALIGN}")
             if ppl is None or ppl > FLUENCY_MAX_PPL:
                 reasons.append(f"perplexity {ppl if ppl is None else round(ppl)} > {FLUENCY_MAX_PPL:g} (closer to shuffled words than to fluent text)")
+
+            score, comment = judge_score(text, language)
+            shuffled_score, _ = judge_score(shuffled(text), language)
+            ref = reference.get(fname)
+            ref_score = judge_score(str(ref), language)[0] if isinstance(ref, str) and ref.strip() else None
+            problems = []
+            if comment.startswith("Error:"):
+                problems.append(comment)
+            elif score is None or shuffled_score is None:
+                problems.append("no score in the judge's reply")
+            elif score <= shuffled_score:
+                problems.append(f"shuffled words scored {shuffled_score:g} >= transcript {score:g}")
+            if ref_score is not None and score is not None and ref_score < score:
+                problems.append(f"reference scored {ref_score:g} < transcript {score:g}")
+            judge_check = "passed" if not problems else "failed: " + "; ".join(problems)
+
             row = {"Filename": fname, "Transcription": text, "LM_Pseudo_Perplexity": None if ppl is None else round(ppl, 1),
                    "Alignment_Score": None if align[fname] is None else round(float(align[fname]), 3),
                    "Transcript_Quality": quality.get(fname), "Fluency_Gate": "passed" if not reasons else "failed: " + "; ".join(reasons),
-                   "LLM_Score": None, "Evaluation_Comment": "not scored by the LLM: " + "; ".join(reasons) if reasons else None}
-            if not reasons:
-                prompt = f"""You are a strict judge of {language_of(state)} speech transcriptions.
-    Evaluate the coherence and fluency of this transcription. Understand the meaning before scoring; do not give every transcription the same score.
-    Score from 0 to 10: 10 for fluent, meaningful sentences, lower the more meaningless it gets, and 0 if it is in a language other than {language_of(state)}.
-    Reply in exactly this format:
-    Score: <0-10>
-    Comment: <one sentence>
-    Transcription: {text[:4000]}"""
-                try:
-                    out = llm.model_copy(update={"num_predict": 200}).invoke(prompt).content
-                    m = re.search(r'Score:\s*(\d+(?:\.\d+)?)', out)
-                    c = re.search(r'Comment:\s*(.*)', out, re.DOTALL)
-                    row["LLM_Score"] = min(10.0, float(m.group(1))) if m else None
-                    row["Evaluation_Comment"] = c.group(1).strip() if c else "Error: reply had no score"
-                except Exception as e:
-                    logging.warning(f"LLM score failed for {fname}: {e}")
-                    row["Evaluation_Comment"] = f"Error: {e}"
+                   "Judge_Model": JUDGE_MODEL, "Judge_Score_Transcript": score, "Judge_Score_Shuffled": shuffled_score,
+                   "Judge_Score_Reference": ref_score, "Judge_Check": judge_check,
+                   "LLM_Score": score if not reasons and not problems else None,
+                   "Evaluation_Comment": comment if not reasons and not problems else
+                       "not scored: " + "; ".join(reasons + [f"judge check {judge_check}"] * bool(problems))}
             rows.append(row)
         output_path = os.path.join(res, "llm_scores.csv")
         pd.DataFrame(rows).to_csv(output_path, index=False)
