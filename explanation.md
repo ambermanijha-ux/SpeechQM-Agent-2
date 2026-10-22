@@ -50,9 +50,12 @@ guide stays correct when lines move.
 | `prepare_runs.py` | Copies your audio into one folder per language and converts transcript JSONs | called by `run_qc.py` (can also be run alone) |
 | `download_models.py` | Checks which models your token can use and downloads them | called by `run_qc.py` (can also be run alone) |
 | `config.py` | All model names, languages, thresholds | imported by everything |
-| `llm.py` | The agent system: plans the checks with an LLM, builds a graph, runs the 24 checks | called by `run_qc.py` (or `python llm.py` in the original prompt mode) |
+| `llm.py` | The agent system: plans the checks with an LLM, builds a graph, runs the 26 checks | called by `run_qc.py` (or `python llm.py` in the original prompt mode) |
 | `utility_functions.py` | Speech and text tools: loading audio, speech detection, ASR, speakers, alignment, language ID | imported by `llm.py` |
 | `summarize.py` | Builds `qc_summary.csv` | called by `run_qc.py` (can also be run alone) |
+| `dashboard.py` | Builds `dashboard.html` from the summary and each run's logs | called by `summarize.py` |
+| `duplicates.py` | Audio fingerprints and text similarity for the duplicate check | imported by `llm.py` |
+| `build_corpus_index.py` | Indexes public corpora for the duplicate check, once | run by hand |
 | `requirements.txt` | The Python packages and exact versions | read by `setup.sh` / `setup.ps1` |
 | `my_secrets.py` | The prompt for the original `python llm.py` mode; no keys | optional |
 | `.gitignore`, `.gitattributes` | Git rules: what not to commit, which line endings to use | git |
@@ -93,7 +96,7 @@ Created on your machine when you use it (never committed):
          │
          ├─ 5/5  for each language:
          │          llm.main(prompt, audio_dir, lang_code)
-         │             ├─ LLM picks which of the 24 checks the prompt asks for (+ deterministic corrections)
+         │             ├─ LLM picks which of the 26 checks the prompt asks for (+ deterministic corrections)
          │             ├─ checks are ordered into layers by their dependencies
          │             ├─ LangGraph runs each layer's checks in parallel
          │             └─ each check writes one CSV into results/
@@ -595,19 +598,20 @@ Every value can be overridden by an environment variable of the same name, e.g. 
 1. **Inputs.** With `audio_dir` given (from `run_qc.py`), it is used directly. Without it (`python llm.py`
    mode), `parse_prompt` extracts a quoted absolute path, a `.csv` path and a language (name such as "Telugu",
    or code such as `te`) from the text, asking the LLM if the regexes find nothing.
-2. **`select_tasks(prompt)`.** The planner LLM gets the menu of 24 checks plus keyword rules and replies with
+2. **`select_tasks(prompt)`.** The planner LLM gets the menu of 26 checks plus keyword rules and replies with
    task numbers.
 3. **`prompt_checker_agent(prompt, selection)`.** A second LLM call compares the selection with the prompt and
    answers `Status: Correct`, `Missing` (with which ones, then the selection is redone with that feedback) or
-   `Extra` (the extras are removed). Up to 3 rounds. Only its removals are used: tasks it adds are ignored,
-   because with qwen3:8b they were mostly never requested (see `implementation.md` §3).
+   `Extra` (the extras are removed). Up to 3 rounds. As in the paper, its verified list is the plan, including
+   tasks it adds (these are recorded in `plan.json` as `added_by_checker`).
 4. **Deterministic corrections** (because an 8B model gets steps 2-3 wrong regularly):
    - `keyword_tasks(prompt)`: regexes for each check's name ("sample rate" → 21, "WER" → 24, ...); any check the
      prompt names but the LLM dropped is added back.
    - `add_dependencies(tasks)`: adds prerequisites using `TASK_DEPS` (e.g. WER needs normalization, which needs
      ASR).
-   - `REFERENCE_TASKS` {9, 16, 18, 23, 24} are removed when no reference CSV exists, with a message, since they
-     could only fail.
+   - `REFERENCE_TASKS` {9, 16, 18, 24, 25, 26} are removed when no reference CSV exists, with a message, since they
+     could only fail. (The duplicate check, 23, then compares the ASR chunks and the audio.)
+   - Everything decided here is written to `results/plan.json`.
 5. **Ordering.** `topological_sort_tasks` asks the LLM for layers such as `[[1, 2, 7], [5, 6, 12], [24]]`.
    `structure_is_valid` checks that every task appears exactly once and comes after its prerequisites. If not,
    `layer_tasks` computes the layers itself (Kahn's algorithm: repeatedly take every task whose prerequisites are
@@ -617,24 +621,32 @@ Every value can be overridden by an environment variable of the same name, e.g. 
    to `END`. LangGraph runs all checks of a layer at the same time (threads) and waits for all of them before
    the next layer. `print_ascii()` draws this graph in the console (the large box diagram you see).
 7. **`invoke(initial_state)`.** Runs the graph. The state is a dictionary every check reads and adds its own
-   output key to (`A` = path of the ASR CSV, `D` = silence, `E` = speakers, `wer_output`, ...).
-8. **Summary.** Prints each output key's value (usually `CSV saved at: ...` or an `Error: ...`).
+   output key to (`A` = path of the ASR CSV, `D` = silence, `E` = speakers, `wer_output`, ...). Every node is
+   wrapped by `monitored()`: after it returns, `monitor_verdict` decides OK / RETRY / REVIEW. Problems that the
+   computed facts show by themselves (expected files without a row, repeated rows, an empty column in an
+   LLM-written output) decide without the LLM; otherwise the monitoring LLM reads the status and the facts.
+   LLM-written steps run once more on RETRY, with the reason added to the code writer's prompt; fixed-code steps
+   are flagged for review. Verdicts go to `results/monitor_log.csv`.
+8. **Re-planning** (`replan`, unless `REPLAN=0`). Steps that failed or that the monitor wanted re-run go back to the planner
+   with the reasons; it names the ones worth one more run (a temporary failure, a missing input), their outputs
+   are removed, and they run again as a small graph. Decisions in `results/replan_log.csv`.
+9. **Summary.** Prints each output key's value (usually `CSV saved at: ...` or an `Error: ...`).
 
 ### 11.3 The checks (nodes)
 
 Each check is a function `xxx_agent(state)` or `xxx_func(state)` that returns `{"<its output key>": "<status>"}`
 and writes a CSV into `results/`. The mapping from number to function is `node_map`. All 24, with how each is
-implemented, are tabulated in `implementation.md` §4; the groups are:
+implemented, are tabulated in `implementation.md` §4 (1-24); the groups are:
 
-- **Fixed code around a model** (1 ASR, 2 speakers, 8 silence, 10 CTC, 15 IndicLID): call functions in
-  `utility_functions.py`.
+- **Fixed code around a model** (1 ASR, 2 speakers, 8 silence, 10 CTC, 15 language ID from text and audio):
+  call functions in `utility_functions.py`.
 - **Fixed Python** (3 transcript quality, 5 vocabulary, 6 script check, 9 English words, 11 upsampling,
-  12 new/old speaker,
-  22 speaker hours, 23 duplicates, 24 WER): deterministic, same result every run.
-- **LLM judge** (13 domain, 17 fluency score): the LLM reads each transcript and answers; the reply is parsed
-  with a regex (`Score: 7` → 7). The fluency score is gated: `pseudo_perplexity` (IndicBERTv2 masks a sample of up
-  to 400 tokens one at a time and averages how surprised it is), the ASR alignment score and transcript quality
-  are measured first, and only transcripts passing all three are sent to the LLM.
+  12 new/old speaker, 22 speaker hours, 23 duplicates (`duplicates.py`), 24 WER, also per reference utterance,
+  25 timestamp segmentation, 26 code-mixing): deterministic, same result every run.
+- **LLM judge** (13 domain, 17 LLM score): the LLM reads each transcript and answers; the reply is parsed
+  with a regex (`Score: 7` → 7). Domain gets definitions of the easily confused labels and at most 3000
+  characters of text. The LLM score is given per file (as in the paper) and, from `asr_chunks.csv`, for up to 30
+  short chunks per file (`judge_chunks`), whose mean follows the real WER far better.
 - **Code-writing agent** (4 characters, 7 length, 14 forced alignment, 16 normalization,
   19 corruption, 20 extension, 21 sample rate): the LLM writes a Python script, see below.
 
@@ -652,9 +664,13 @@ writes the program itself.
    tool call, which some models produce instead).
 4. `run_code()` executes it with `exec()` in a fresh namespace, capturing what it prints. Errors are caught and
    reduced to the last few traceback lines; a script calling `exit()` cannot stop the pipeline.
-5. The output CSV is validated: it must exist, be readable, and have the expected number of rows (one per audio
-   file or input row). If anything is wrong, the error or the row-count mismatch goes back to the LLM as a new
-   message ("Running your script printed ... Fix it"), up to 3 attempts.
+5. The output CSV is validated by the task's check (`check_files`, `check_sample_rate`, `check_normalization`, ...):
+   it must exist, name exactly the expected files, have no blank values, and hold values that match the files
+   (e.g. the sample rate and duration really are the file's). If anything is wrong, the error or the problems go
+   back to the LLM as a new message ("Running your script printed ... Fix it"), up to 3 attempts. If all fail the
+   output is deleted, and the **tool library** gets a turn: a script for the same output that passed its checks in
+   an earlier run (`tool_library/<output>.json`, paths replaced by placeholders) runs with this run's paths and is
+   validated the same way. Each passing script is saved there.
 6. `AGENT_LOCK` makes only one agent run at a time (the code temporarily redirects `print` output, and Ollama
    answers one request at a time anyway).
 
@@ -699,30 +715,42 @@ task prompts in `llm.py`, but run the tool on data you are allowed to process, a
 
 ### 12.3 ASR (speech to text)
 
-- `asr_model_for(language)`: tries each model in `ASR_MODELS[language]` by loading it; a gated model without
-  access raises an error, so the next candidate (Vakyansh) is used. Cached per language.
-- `asr_chunks(audio)`: speech regions merged into pieces of at most 8 s. wav2vec2 models handle short pieces
-  best (on Hindi and Telugu tests, 8 s gave lower WER than 30 s or 5 s), and long pieces would not fit in memory.
-- `transcribe_audio(path, language)`: for each piece, the processor normalizes the waveform, the model outputs a
-  score for every character at every 20 ms frame (*logits*), `argmax` picks the best character per frame, and
-  `batch_decode` collapses repeats and blanks into words (CTC greedy decoding).
-- `transcribe_folder_to_csv`: all audio files → `indicconf_hypothesis.csv` (`Filename`,
-  `Indiconformer_Hypothesis`). Skips the work if that file already exists.
+- `main_asr_for(language)`: the main ASR. With `ASR_ENGINE=best` (default) it is **IndicConformer-600M** (ONNX,
+  RNNT decoder) for the 14 Indian languages it covers and **Whisper-large-v3** for English; with `ASR_ENGINE=wav2vec`
+  the wav2vec2 models below. (On 10 reference files the pooled WER was 0.857 for wav2vec2 and 0.659 for
+  IndicConformer.)
+- `asr_model_for(language)`: the wav2vec2 model (second opinion, CTC score, forced alignment): tries each model in
+  `ASR_MODELS[language]`; a gated model without access raises an error, so the next candidate (Vakyansh) is used.
+- `get_indicconformer()`: loads the model's ONNX sessions on the GPU with a memory cap. TorchScript fusion is off
+  while it runs, because its feature extractor fails to compile with the CUDA 13 builds.
+- `asr_chunks(audio)`: speech regions merged into pieces of at most 8 s; every engine gets the same pieces.
+- `transcribe_pieces(pieces, language, engine)`: one text per piece. IndicConformer's RNNT decoder returns nothing
+  for some pieces (23 of 41 in the Gujarati file); those pieces get its CTC decoder's text (pooled WER 0.654 → 0.635).
+- `transcribe_audio(path, language, second_opinion, chunks)`: the file's text; optionally also the wav2vec2 text and
+  the per-chunk texts with their times.
+- `transcribe_folder_to_csv`: all audio files → `indicconf_hypothesis.csv` (`Filename`, `Indiconformer_Hypothesis`),
+  `asr_second_opinion.csv` (the wav2vec2 text and `ASR_Disagreement`, its WER against the main ASR: a quality signal
+  that needs no reference) and `asr_chunks.csv` (start, end and text of every chunk; the LLM judge scores these).
+  Skips the work if `indicconf_hypothesis.csv` already exists.
 
 ### 12.4 Speakers (diarization) and new/old speakers
 
-- `diarize(audio)` returns `{speaker label: (seconds spoken, voice fingerprint)}` for one file. The fingerprint
-  ("embedding") is a vector that is similar for the same voice and different for different voices.
+- `diarize(audio)` returns `({speaker label: (seconds spoken, voice fingerprint)}, seconds with speech)` for one
+  file. The fingerprint ("embedding") is a vector that is similar for the same voice and different for different
+  voices. A speaker's seconds include talking over someone else, so the speakers' seconds can add up to more than
+  the speech; the difference is the overlap.
   - `diarize_pyannote`: pyannote's `speaker-diarization-3.1` pipeline with `return_embeddings=True`. Speakers too
     short to get a fingerprint are counted but never matched across files.
   - `diarize_local`: speech regions → overlapping 3 s windows every 1.5 s → ECAPA fingerprints → agglomerative
     clustering (windows closer than cosine distance 0.7 join the same speaker) → tiny clusters (< 5 % of the
     speech or < 1 s) are merged into their nearest big cluster.
-- `save_num_speakers(folder)`: per file, matches each local speaker against a **folder-wide registry** of known
-  voices: cosine similarity ≥ 0.6 → same person, same global ID (`SPEAKER_03` in two files is the same voice);
-  otherwise a new ID. Writes `num_speakers.csv` (`File Name`, `Number of Speakers`, `Speaker Durations` as JSON
-  in hours). pyannote alone would call the first speaker of *every* file `SPEAKER_00`, which is why this
-  registry exists. Check 12 (new/old) and 22 (hours per speaker) read this file.
+- `save_num_speakers(folder)`: per file, matches each local speaker against a registry of known voices: those of
+  earlier files of this folder **and of earlier batches** (`speaker_db/speakers.npz`, see `load_speaker_db`):
+  cosine similarity ≥ 0.6 → same person, same global ID; otherwise a new ID. Files are identified by the MD5 of
+  their bytes, so re-running a file first removes its old entries (a re-run does not find its own speakers).
+  Writes `num_speakers.csv` (`File Name`, `Number of Speakers`, `Speaker Durations` as JSON in hours, `Speech (s)`,
+  `Overlap (s)`, `Earlier Batches`: per speaker, where they were heard before). Check 12 (new/old) and 22 (hours per
+  speaker) read this file.
 
 ### 12.5 CTC score (forced alignment)
 
@@ -739,11 +767,12 @@ task prompts in `llm.py`, but run the tool on data you are allowed to process, a
 
 ### 12.6 Upsampling
 
-`is_upsampled_from_8k_v2`: takes the frequency spectrum (FFT) of the audio at the file's own sample rate; if the
-file is stored above 8 kHz and less than 2 % of the energy is between 4 and 8 kHz, the recording has no real
-high-frequency content: it was narrowband (8 kHz, typical of phone calls) and later upsampled, even though the file
-says 16 or 48 kHz. A file stored at 8 kHz is not upsampled (the sample rate check reports it). An earlier version
-resampled every file to 16 kHz first, which made every 8 kHz file look upsampled.
+`effective_bandwidth(path)`: the long-term spectrum (Welch) at the file's own rate, smoothed over ~200 Hz; the
+bandwidth is the highest frequency within 50 dB of the speech band (300-3000 Hz). Audio resampled up from a lower
+rate has nothing above the old Nyquist frequency, so the estimated original rate is the lowest standard rate (8,
+11.025, 16, 22.05, 24, 32, 44.1, 48 kHz) that holds the bandwidth. `check_upsampling_folder` writes
+`upsampling_check.csv` with the stored rate, `Bandwidth_Hz`, `Estimated_Original_Rate` and `Is_Upsampled` (original
+below stored). Our 48 kHz files carry ~3 kHz of bandwidth: phone audio upsampled from 8 kHz.
 
 ### 12.7 Language identification (IndicLID)
 
@@ -753,6 +782,12 @@ resampled every file to 16 kHz first, which made every 8 kHz file look upsampled
   **IndicBERT** classifier decides.
 - `get_indiclid()` loads all three once; the BERT checkpoint is a complete pickled model, loaded with
   `weights_only=False` (PyTorch's newer default refuses pickles).
+
+**From the audio** (`audio_language(path)`): the text can only be in the language the ASR was told to write, so
+English audio in a Hindi folder became Hindi-script text that IndicLID called Kashmiri. Whisper-large-v3 (language
+token probabilities from one decoder step) and MMS-LID-126 (a wav2vec2 classifier) each hear the first 30 s of
+speech; the more confident answer wins (172/180 correct on labelled public clips, vs 154 and 165 alone). Task 15
+writes both, with `Audio_Matches_Expected`.
 
 ### 12.8 Transliteration
 
@@ -773,13 +808,31 @@ word). Needs reference transcripts; skipped for English.
 - Starts from the list of audio files in each `<language>/audios` folder, so every file gets a row even if a
   check failed for it.
 - `COLUMNS` says which columns to take from which result file and what to call them in the summary
-  (`sample_rate_check.csv: Status → Sample_Rate_Status`, ...). Matching is case-insensitive and supports
+  (`sample_rate_check.csv: Sample_Rate → Sample_Rate`, ...). Matching is case-insensitive and supports
   wildcards (`Is_*` matches `Is_Tamil`).
 - Each result file is joined on the file name (`Filename`, `filename` and `File Name` are all recognized).
   Missing files or columns leave empty cells.
 - Saved as UTF-8 with a byte-order mark (`utf-8-sig`), so Excel displays Indic text correctly.
 
+- Then `dashboard.write` (`dashboard.py`) builds `dashboard.html`: findings per file (corrupt, upsampled, audio in
+  another language, failed transcript quality, WER > 0.8, shared audio, public-corpus matches, ...), each language
+  run's plan, monitor verdicts, re-planning and tool-library use, and the whole table (sortable, filterable). One
+  file, no network needed.
+
 Run it alone: `.venv/bin/python summarize.py <results folder>`.
+
+### 13.1 `duplicates.py` and `build_corpus_index.py`
+
+- `landmarks(audio)`: at 8 kHz, the strongest spectral peaks (~30 per second) are paired with the next 5 peaks up to
+  1 s later; each pair (two frequencies and their time gap) is a hash. The same recording gives the same hashes
+  after re-encoding, gain changes or noise. Hashes that repeat within a recording (tones, hum, beeps) are dropped:
+  they would match any file with the same sound.
+- `FingerprintIndex`: sorted arrays of (hash, recording, frame). Two recordings match when at least 40 hashes agree
+  at one time offset; the offset and the matched stretch say where.
+- `audio_near_duplicates(paths)`: every pair of files in the batch; `public_audio_matches`: each file against the
+  public index. `text_matches`: TF-IDF of character 3-grams, cosine ≥ 0.9, utterances of 4+ words.
+- `build_corpus_index.py <folder or manifest.csv> ...`: fingerprints and transcripts of public corpora into
+  `models/public_corpus_index/index.pkl`.
 
 ---
 

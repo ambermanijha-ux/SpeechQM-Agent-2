@@ -14,7 +14,8 @@ from pathlib import Path
 from huggingface_hub import auth_check, constants, snapshot_download
 from huggingface_hub.errors import HfHubHTTPError
 
-from config import (ASR_MODELS, ALIGN_MODEL, INDICBERT_TOKENIZER, INDICLID_DIR, OLLAMA_BASE_URL, PLANNER_MODEL,
+from config import (ASR_MODELS, ALIGN_MODEL, INDICBERT_TOKENIZER, INDICLID_DIR, OLLAMA_BASE_URL, PLANNER_MODEL, JUDGE_MODEL, MONITOR_MODEL,
+                    ASR_ENGINE, INDICCONFORMER, INDICCONFORMER_LANGS, ENGLISH_ASR, AUDIO_LID_MODELS,
                     CODER_MODEL)
 
 INDICLID_URL = "https://github.com/AI4Bharat/IndicLID/releases/download/v1.0/"
@@ -45,7 +46,7 @@ def ollama_models() -> list:
         return [m["name"] for m in json.load(r)["models"]]
 
 
-def ensure_ollama(models=(PLANNER_MODEL, CODER_MODEL)):
+def ensure_ollama(models=tuple(m for m in (PLANNER_MODEL, CODER_MODEL, JUDGE_MODEL, MONITOR_MODEL) if m.lower() not in ("none", "off"))):
     have = ollama_models()
     for m in dict.fromkeys(models):
         if m in have or f"{m}:latest" in have:
@@ -84,10 +85,19 @@ def ensure_hf(languages, speech_backend="pyannote"):
     for repo in dict.fromkeys(repos):
         print(f"hf: {repo}")
         snapshot_download(repo, allow_patterns=HF_WEIGHTS)   # offline: resolves from the cache
-    print(f"hf: {INDICBERT_TOKENIZER} (IndicLID tokenizer and fluency language model, ~1.1 GB)")
+    import utility_functions as U
+    if ASR_ENGINE == "best" and any(lang in INDICCONFORMER_LANGS for lang in languages):
+        print(f"hf: {INDICCONFORMER} (main ASR, ~2.4 GB)")
+        U.get_indicconformer()
+    if ASR_ENGINE == "best" and "English" in languages:
+        print(f"hf: {ENGLISH_ASR} (English ASR, ~3 GB)")
+        snapshot_download(ENGLISH_ASR, allow_patterns=HF_WEIGHTS)
+    for repo in AUDIO_LID_MODELS:   # audio language ID (task 15): Whisper-large-v3 ~3 GB, MMS-LID-126 ~3.9 GB
+        print(f"hf: {repo} (audio language ID)")
+        snapshot_download(repo, allow_patterns=HF_WEIGHTS)
+    print(f"hf: {INDICBERT_TOKENIZER} (IndicLID tokenizer, ~1.1 GB)")
     snapshot_download(INDICBERT_TOKENIZER, allow_patterns=HF_WEIGHTS)
     # loading once downloads everything the VAD/diarization models pull in (embedding model, PLDA, ECAPA)
-    import utility_functions as U
     print(f"speech: {speech_backend} VAD + diarization")
     U.get_vad_model()
     U.get_diarization_pipeline() if speech_backend == "pyannote" else U.get_speaker_encoder()

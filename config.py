@@ -3,6 +3,26 @@ import os
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+
+
+def load_dotenv(path=HERE / ".env"):
+    """KEY=value lines from .env (HF_TOKEN, CODER_MODEL, ...) into os.environ; variables already set in the shell win."""
+    if not path.is_file():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.removeprefix("export ").split("=", 1)
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        if value:
+            os.environ.setdefault(key.strip(), value)
+
+
+load_dotenv()   # before any os.environ.get below
+
 MODELS_DIR = HERE / "models"
 INDICLID_DIR = MODELS_DIR / "indiclid"
 
@@ -10,7 +30,11 @@ INDICLID_DIR = MODELS_DIR / "indiclid"
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
 PLANNER_MODEL = os.environ.get("PLANNER_MODEL", "qwen3:8b")   # task selection, DAG, domain, judge (best of qwen2.5 7b/14b, qwen3 8b on task selection)
 CODER_MODEL = os.environ.get("CODER_MODEL", "qwen3:8b")   # writes + repairs the per-task Python scripts (9/9 vs 2/9 for qwen2.5-coder:7b)
+JUDGE_MODEL = os.environ.get("JUDGE_MODEL") or PLANNER_MODEL   # LLM-as-a-judge score (task 17); default: the planner
+MONITOR_MODEL = os.environ.get("MONITOR_MODEL") or PLANNER_MODEL   # reviews every step's output (paper §2.4); "none" turns it off
 LLM_NUM_CTX = int(os.environ.get("LLM_NUM_CTX", "8192"))
+# longest reply the code writer may give; a model stuck repeating a regex ran to the full context (~6 min per try)
+CODER_MAX_TOKENS = int(os.environ.get("CODER_MAX_TOKENS", "3000"))
 
 # Speech models. The ai4bharat ones are gated: accept their terms on Hugging Face and log in
 # (`.venv/bin/hf auth login`) before running download_models.py.
@@ -49,6 +73,29 @@ SCRIPTS = {"Hindi": ("Devanagari", 0x0900, 0x097F), "Sanskrit": ("Devanagari", 0
            "Nepali": ("Devanagari", 0x0900, 0x097F)}
 # CTC alignment model: Vakyansh Hindi for Hindi (as in the original), else the language's own ASR model
 ALIGN_MODEL = os.environ.get("ALIGN_MODEL", "Harveenchadha/vakyansh-wav2vec2-hindi-him-4200")
+# Main ASR (benchmark of 2026-10-22, qc_audit/asr_bench: pooled WER 0.66 vs 0.86 for the wav2vec2 models above on 10
+# reference files, better on 9 of 10): IndicConformer-600M for the Indic languages it covers, Whisper-large-v3 for
+# English. The wav2vec2 models of ASR_MODELS stay for CTC scoring and forced alignment and give a second ASR opinion.
+# ASR_ENGINE=wav2vec brings back the wav2vec2 models as the main ASR.
+ASR_ENGINE = os.environ.get("ASR_ENGINE", "best")
+INDICCONFORMER = "ai4bharat/indic-conformer-600m-multilingual"   # gated: accept its terms on Hugging Face
+INDICCONFORMER_DIR = MODELS_DIR / "indic-conformer-600m-multilingual"
+INDICCONFORMER_DECODER = os.environ.get("INDICCONFORMER_DECODER", "rnnt")   # rnnt (pooled WER 0.659) or ctc (0.666)
+INDICCONFORMER_LANGS = {"Hindi": "hi", "Bengali": "bn", "Tamil": "ta", "Telugu": "te", "Marathi": "mr", "Gujarati": "gu",
+                        "Kannada": "kn", "Malayalam": "ml", "Odia": "or", "Punjabi": "pa", "Assamese": "as",
+                        "Urdu": "ur", "Nepali": "ne", "Sanskrit": "sa"}
+ENGLISH_ASR = os.environ.get("ENGLISH_ASR", "openai/whisper-large-v3")
+ASR_GPU_MEM_GB = float(os.environ.get("ASR_GPU_MEM_GB", "12"))   # ONNX Runtime arena cap (GPUs shared with Ollama)
+# Audio language ID (task 15, next to IndicLID on the text): both models hear up to 30 s of speech and the more
+# confident one wins (qc_audit/lid_bench: 172/180 labelled public clips, vs 154 Whisper and 165 MMS alone)
+AUDIO_LID_MODELS = ("openai/whisper-large-v3", "facebook/mms-lid-126")
+# Speakers remembered across batches (task 12): a voice heard in an earlier run is "Old". "none" turns it off.
+SPEAKER_DB = os.environ.get("SPEAKER_DB") or str(HERE / "speaker_db")
+# Public corpora for the duplicate check (task 23): build_corpus_index.py writes this index once
+PUBLIC_INDEX = Path(os.environ.get("PUBLIC_INDEX") or MODELS_DIR / "public_corpus_index")
+# Scripts the code-writing LLM wrote that passed their checks; run only when every new attempt fails
+TOOL_LIBRARY = HERE / "tool_library"
+REPLAN = os.environ.get("REPLAN", "1") not in ("0", "false", "no")   # re-plan and re-run steps that failed once
 # VAD + diarization: "pyannote" (original models; gated, needs `hf auth login`) or "local" (Silero VAD +
 # SpeechBrain ECAPA clustering; no token needed)
 SPEECH_BACKEND = os.environ.get("SPEECH_BACKEND", "pyannote")
@@ -64,10 +111,6 @@ INDICBERT_TOKENIZER = "ai4bharat/IndicBERTv2-MLM-only"
 DIAR_WINDOW_S = 3.0             # embedding window (tuned on 3 labelled Hindi clips: 1, 2 and 3 speakers all correct)
 DIAR_HOP_S = 1.5
 DIAR_CLUSTER_THRESHOLD = 0.7    # cosine distance at which two windows stop being merged within a file
-# fluency gate for the LLM score (task 17): IndicBERTv2 pseudo-perplexity. Calibrated on 11 human reference
-# transcripts (9.7-52.5) vs the same words shuffled (397-1512); 150 lies between the two
-FLUENCY_MAX_PPL = float(os.environ.get("FLUENCY_MAX_PPL", "150"))
-FLUENCY_MIN_ALIGN = float(os.environ.get("FLUENCY_MIN_ALIGN", "0.5"))   # CTC alignment score of the ASR transcript
 SPEAKER_MATCH_THRESHOLD = float(os.environ.get("SPEAKER_MATCH_THRESHOLD", "0.6"))   # cosine similarity: same speaker across files (both backends)
 
 

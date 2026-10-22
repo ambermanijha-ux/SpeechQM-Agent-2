@@ -93,20 +93,21 @@ prompt ──► select_tasks (LLM) ──► prompt_checker_agent (LLM, ≤ 3 r
 | Check | Needs |
 |---|---|
 | 3 | 1 (ASR transcript), 8 (silence, for the speech duration) |
-| 17 | 1, 3 (quality), 14 (ASR alignment) |
+| 17 | 1 |
 | 4, 5, 6, 10, 13, 14, 15, 16 | 1 (ASR transcript) |
 | 12, 22 | 2 (speaker table) |
-| 9, 23, 24 | 16 (normalized reference) |
+| 9, 24 | 16 (normalized reference) |
+| 23 | 1 (ASR chunks, when there is no reference), 16 (normalized reference, when there is one) |
 
-## 4. The 24 checks
+## 4. The 26 checks
 
 Implementation types: **model** = fixed code around a speech/text model; **code** = fixed Python;
 **agent** = the code-writing agent (section 5) writes and runs a script; **judge** = the LLM answers per transcript.
 
 | # | Check | Output (`results/`) | Type | Notes |
 |---|---|---|---|---|
-| 1 | ASR transcription | `indicconf_hypothesis.csv` | model | wav2vec2 CTC per language (section 6.2) |
-| 2 | Speakers and durations | `num_speakers.csv` | model | pyannote or local diarization, global speaker IDs (6.3) |
+| 1 | ASR transcription | `indicconf_hypothesis.csv`, `asr_second_opinion.csv`, `asr_chunks.csv` | model | IndicConformer-600M RNNT (CTC for chunks RNNT leaves empty) for 14 Indic languages, Whisper-large-v3 for English; wav2vec2 as second opinion (`ASR_Disagreement`) (6.2) |
+| 2 | Speakers and durations | `num_speakers.csv` | model | pyannote or local diarization, global speaker IDs across files and batches (`speaker_db/`), speech and overlap seconds (6.3) |
 | 3 | Transcript quality | `transcript_quality.csv` | code | fails: ≤ 3 words, > 20 % repeated 4-word phrases (loops), or < 5 letters per second of speech (ASR dropped speech) |
 | 4 | Characters (graphemes) | `character_list.csv` | agent | |
 | 5 | Vocabulary | `vocab_list.csv` | code | unique words, tags removed |
@@ -115,20 +116,22 @@ Implementation types: **model** = fixed code around a speech/text model; **code*
 | 8 | Silence | `vad_silence_stats.csv` | model | duration − detected speech |
 | 9 | English word count | `english_word_count.csv` | code | Latin-script words in the reference |
 | 10 | CTC score | `ctc_scores.csv` | model | forced alignment, per file of the reference if it has one, else the ASR transcript (`Transcript_Source`) (6.4) |
-| 11 | Upsampling | `upsampling_check.csv` | code | stored above 8 kHz with energy 4–8 kHz < 2 % of total, at the file's own rate; native 8 kHz files are not upsampled |
-| 12 | New / old speaker | `valid_speaker.csv` | code | `Old` when any of the file's global speaker IDs (`num_speakers.csv`) appears in another file, listing those files |
-| 13 | Domain | `domain_check.csv` | judge | one label per file; reply capped at 30 tokens and must name a listed domain, else `Unknown` |
+| 11 | Upsampling | `upsampling_check.csv` | code | bandwidth (highest frequency within 50 dB of the speech band) → lowest standard rate holding it = estimated original rate; upsampled when below the stored rate |
+| 12 | New / old speaker | `valid_speaker.csv` | code | `Old` when any of the file's global speaker IDs (`num_speakers.csv`) appears in another file or an earlier batch, listing them |
+| 13 | Domain | `domain_check.csv` | judge | one label per file from the reference (else the ASR text), ≤ 3000 characters, definitions of confusable labels; reply capped at 30 tokens and must name a listed domain, else `Unknown` |
 | 14 | Forced alignment | `audio_transcript_matching.csv` | agent | script calls `force_alignment_and_ctc_score` with the language's model |
-| 15 | Language identification | `indiclid_language_identification.csv` | model | IndicLID (6.5) |
+| 15 | Language identification | `indiclid_language_identification.csv` | model | IndicLID on the ASR text; Whisper-large-v3 + MMS-LID-126 on 30 s of the audio, the more confident wins (6.5) |
 | 16 | Normalization (remove tags) | `normalized_list.csv` | agent | removes HTML/XML-style tags from the reference |
-| 17 | LLM score | `llm_scores.csv` | judge (gated) | perplexity (`pseudo_perplexity`, IndicBERTv2), alignment (task 14) and quality (task 3) for every file; the LLM's 0–10 score only when all pass (`FLUENCY_MAX_PPL` 150, `FLUENCY_MIN_ALIGN` 0.5) |
+| 17 | LLM score | `llm_scores.csv`, `asr_chunk_judgements.csv` | judge | 0–10 per transcript with a comment (as in the paper), and 0–10 for up to 30 ASR chunks per file: `LLM_Chunk_Score`, `Low_Score_Chunk_Share` |
 | 18 | Transliteration | `*_transliterated.csv`, `transliteration_words.csv` | model + judge | reference only; a Roman word is replaced only when two LLM runs (different prompts, JSON, batches of 40) agree, the answer is in the script and, if IndicXlit is available (installed or the `speechqm-indicxlit` Docker image), it is in IndicXlit's top 5; skipped for English |
 | 19 | Corruption | `corruption_check.csv` | agent | empty, unreadable by soundfile, or `.mp3` → corrupt (SpeechQM rule) |
 | 20 | File extension | `audio_format_check.csv` | agent | `.wav` valid |
-| 21 | Sample rate | `sample_rate_check.csv` | agent | 16 kHz → Pass |
+| 21 | Sample rate | `sample_rate_check.csv` | agent | `Sample_Rate` and `Channels` as stored, reported only |
 | 22 | Speaker durations (dataset) | `speaker_durations.csv` | code | total hours per global speaker |
-| 23 | Duplicate utterances | `duplicate_utterances.csv` | code | identical normalized references |
-| 24 | WER | `wer.csv` | code | `jiwer` per file paired by filename, punctuation and tags removed |
+| 23 | Duplicates | `duplicate_utterances.csv`, `near_duplicates.csv`, `duplicates_per_file.csv` | code | identical normalized references; near-duplicate utterances (TF-IDF character 3-grams ≥ 0.9); shared audio (landmark fingerprints); matches in the public-corpus index |
+| 24 | WER | `wer.csv`, `segment_wer.csv` | code | `jiwer` WER and CER per file paired by filename, punctuation and tags removed; second ASR's WER; every reference utterance transcribed on its own (with/without cross-talk) |
+| 25 | Timestamp segmentation | `segments.csv`, `segmentation_summary.csv`, `segments/*.wav` | code | utterances cut at the reference time-stamps and aligned; timing issues vs notes |
+| 26 | Code-mixing | `code_mixing.csv`, `code_mixing_summary.csv` | code | script per word, Code-Mixing Index (Das & Gambäck 2014), other scripts |
 
 Text checks share `llm.words()`: removes `[...]` / `<...>` tags and splits on Unicode punctuation, symbols,
 separators and controls, keeping combining marks. Python's `\w` and `str.isalpha()` treat Indic vowel signs

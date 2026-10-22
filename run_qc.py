@@ -13,7 +13,9 @@
 """
 import argparse
 import getpass
+import json
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -27,15 +29,17 @@ if os.name == "nt" and not sys.flags.utf8_mode and __name__ == "__main__":
     sys.exit(subprocess.call([sys.executable, "-X", "utf8", *sys.argv], env={**os.environ, "PYTHONUTF8": "1"}))
 os.environ.setdefault("PYTHONUTF8", "1")   # inherited by anything run from here
 sys.path.insert(0, str(HERE))
+import config  # noqa: E402  (loads .env: HF_TOKEN etc. are read below)
 
-# all 24 checks of the paper (Table 10)
+# all 26 checks: the paper's 24 (Table 10) plus timestamp segmentation and code-mixing (Table 1)
 DEFAULT_CHECKS = ("Perform QC checks for corruption and file extension, sample rate check, audio length, "
                   "VAD silence detection, upsampling, number of speakers, speaker duration, verify if speakers are "
                   "new or old, IndicLID language identification, verify language as {language}, transcript quality, "
-                  "character calculation, vocab calculation, CTC score, forced alignment, LLM score and check domain")
+                  "character calculation, vocab calculation, CTC score, forced alignment, LLM score, check domain "
+                  "and utterance duplicate check")
 # these compare against reference transcripts, so they run only where transcript JSONs were found
-REFERENCE_CHECKS = (", WER computation, normalization, English word count, transliteration and utterance "
-                    "duplicate check")
+REFERENCE_CHECKS = (", WER computation, normalization, English word count, transliteration, "
+                    "timestamp segmentation and code-mixing detection")
 OLLAMA_HELP = {
     "darwin": "install the Ollama app from https://ollama.com/download (or `brew install ollama`), then open it",
     "win32": "install Ollama from https://ollama.com/download (or `winget install Ollama.Ollama`), then start it",
@@ -136,8 +140,63 @@ def check_ollama():
 def clear_results(run: Path):
     """Old outputs would be reused (the transcription step skips existing files): keep only the references."""
     for f in (run / "results").glob("*"):
-        if f.is_file() and f.name != "indicconf_hypothesis-gt.csv":
+        if f.is_file() and f.name not in ("indicconf_hypothesis-gt.csv", "reference_segments.csv"):
             f.unlink()
+        elif f.is_dir() and f.name == "segments":   # utterance audio cut by task 25
+            shutil.rmtree(f)
+
+
+def ollama_model(name):
+    """Model name with its quantization as Ollama reports it, e.g. {'name': 'qwen3:8b', 'quantization': 'Q4_K_M'}."""
+    import urllib.request
+    from config import OLLAMA_BASE_URL
+    try:
+        req = urllib.request.Request(f"{OLLAMA_BASE_URL}/api/show", data=json.dumps({"model": name}).encode())
+        with urllib.request.urlopen(req, timeout=10) as r:
+            d = json.load(r).get("details", {})
+        return {"name": name, "parameters": d.get("parameter_size"), "quantization": d.get("quantization_level")}
+    except Exception:
+        return {"name": name}
+
+
+def run_info(hf_user, backend, device):
+    """What produced the results (written as run_info.json next to qc_summary.csv): results from runs with
+    different models, Hugging Face access or IndicXlit availability are not comparable."""
+    import config
+    from utility_functions import xlit_backend
+    try:
+        commit = subprocess.run(["git", "-C", str(HERE), "describe", "--always", "--dirty"], capture_output=True,
+                                text=True).stdout.strip() or None
+    except OSError:
+        commit = None
+    return {"started": time.strftime("%Y-%m-%d %H:%M:%S"), "host": platform.node(), "device": device,
+            "code": commit, "planner_model": ollama_model(config.PLANNER_MODEL),
+            "coder_model": {**ollama_model(config.CODER_MODEL), "max_tokens": config.CODER_MAX_TOKENS},
+            "judge_model": ollama_model(config.JUDGE_MODEL), "monitor_model": ollama_model(config.MONITOR_MODEL),
+            "hf_user": hf_user, "speech_backend": backend, "indicxlit": xlit_backend(),
+            "audio_lid_models": list(config.AUDIO_LID_MODELS), "speaker_db": config.SPEAKER_DB,
+            "public_corpus_index": public_index_info(), "replan": config.REPLAN, "languages": {}}
+
+
+def public_index_info():
+    """Corpora in the duplicate check's public index (build_corpus_index.py), or None."""
+    import duplicates
+    idx = duplicates.load_public_index()
+    if not idx:
+        return None
+    from collections import Counter
+    return dict(Counter(m["corpus"] for m in idx["meta"]))
+
+
+def language_info(language, seconds, failed):
+    """ASR / alignment model actually used (the first candidate that loaded) and the run time."""
+    from utility_functions import asr_model_for, align_model_for, main_asr_for
+    try:
+        engine, asr = main_asr_for(language)
+        second, align = (None if engine == "wav2vec" else asr_model_for(language)), align_model_for(language)
+    except Exception as e:
+        asr = second = align = f"unavailable ({type(e).__name__})"
+    return {"asr_model": asr, "second_asr_model": second, "align_model": align, "seconds": round(seconds), "failed": failed}
 
 
 def main():
@@ -167,6 +226,7 @@ def main():
     languages = [lang.title() for lang in runs]
 
     step("2/5 Hugging Face access")
+    user = None
     if online():
         user = None if args.no_token else setup_token(args.token, ask)
         backend = check_gated(languages, ask) if user else "local"
@@ -195,6 +255,7 @@ def main():
     from config import LANG_CODES
     codes = {v: k for k, v in LANG_CODES.items()}
     failed = []
+    info = run_info(user, SPEECH_BACKEND, torch_device())
     for lang, run in runs.items():
         language = lang.title()
         clear_results(run)
@@ -202,8 +263,8 @@ def main():
         checks = DEFAULT_CHECKS.format(language=language) + (REFERENCE_CHECKS if has_reference else "")
         prompt = (args.prompt or checks) + f" (language: {language})"
         if not has_reference and not args.prompt:
-            print(f"(no reference transcripts for {language}: WER, normalization, English-word, transliteration "
-                  "and duplicate checks skipped)")
+            print(f"(no reference transcripts for {language}: WER, normalization, English-word, transliteration, "
+                  "segmentation and code-mixing checks skipped)")
         print(f"\n--- {language}: {run / 'audios'}", flush=True)
         t = time.time()
         try:
@@ -212,10 +273,14 @@ def main():
         except Exception as e:
             failed.append(language)
             print(f"--- {language} FAILED: {type(e).__name__}: {e} (details in {HERE / 'pipeline.log'})")
+        info["languages"][language] = language_info(language, time.time() - t, language in failed)
 
     import summarize
-    path = summarize.write_summary(out, runs)
-    print(f"\nPer-check CSVs: {out / '<language>' / 'results'}\nSummary (one row per file): {path}")
+    info["finished"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    (out / "run_info.json").write_text(json.dumps(info, indent=1, ensure_ascii=False), encoding="utf-8")
+    path = summarize.write_summary(out, runs)   # also dashboard.html, which shows run_info.json
+    print(f"\nPer-check CSVs: {out / '<language>' / 'results'}\nSummary (one row per file): {path}\n"
+          f"Dashboard: {out / 'dashboard.html'}")
     if failed:
         sys.exit(f"Failed languages: {', '.join(failed)}")
 

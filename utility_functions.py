@@ -15,9 +15,11 @@ import threading
 from functools import lru_cache
 from typing import List, Tuple
 from torch.utils.data import Dataset
-from config import (ASR_MODELS, ALIGN_MODEL, DEFAULT_LANGUAGE, SPEAKER_MODEL, INDICBERT_TOKENIZER, INDICLID_DIR, MODELS_DIR,
+from config import (ASR_MODELS, ALIGN_MODEL, ASR_ENGINE, INDICCONFORMER, INDICCONFORMER_DIR, INDICCONFORMER_DECODER,
+                    INDICCONFORMER_LANGS, ENGLISH_ASR, ASR_GPU_MEM_GB, DEFAULT_LANGUAGE, SPEAKER_MODEL, INDICBERT_TOKENIZER, INDICLID_DIR, MODELS_DIR,
                     SPEECH_BACKEND, HF_TOKEN, PYANNOTE_VAD_MODEL, PYANNOTE_DIARIZATION,
-                    DIAR_WINDOW_S, DIAR_HOP_S, DIAR_CLUSTER_THRESHOLD, SPEAKER_MATCH_THRESHOLD, torch_device)
+                    DIAR_WINDOW_S, DIAR_HOP_S, DIAR_CLUSTER_THRESHOLD, SPEAKER_MATCH_THRESHOLD, LANG_CODES,
+                    AUDIO_LID_MODELS, SPEAKER_DB, torch_device)
 
 SR = 16000
 DEVICE = torch_device()
@@ -93,6 +95,18 @@ def xlit_candidates(words, lang_code, topk=5):
     except Exception as e:
         logging.warning(f"IndicXlit container failed: {e}")
         return None
+
+
+def xlit_backend():
+    """How IndicXlit is reachable: 'native', 'docker' or None (then transliteration relies on two LLM runs only)."""
+    import importlib.util
+    import shutil
+    import subprocess
+    if importlib.util.find_spec("ai4bharat") is not None:
+        return "native"
+    if shutil.which("docker") and subprocess.run(["docker", "image", "inspect", XLIT_IMAGE], capture_output=True).returncode == 0:
+        return "docker"
+    return None
 
 
 def transliterate_file(file_path: str, lang_code: str, llm=None) -> str:
@@ -198,7 +212,7 @@ def get_vad_model():
             model = Model.from_pretrained(PYANNOTE_VAD_MODEL, token=HF_TOKEN)
             pipeline = VoiceActivityDetection(segmentation=model)
             pipeline.instantiate({"min_duration_on": 0.0, "min_duration_off": 0.0})
-            return pipeline
+            return pipeline.to(torch.device(DEVICE))   # pyannote pipelines start on the CPU (95 s of audio: 40 s)
         from silero_vad import load_silero_vad
         threads = torch.get_num_threads()
         model = load_silero_vad()
@@ -239,9 +253,49 @@ def asr_chunks(audio):
     return chunks
 
 
-@lru_cache(maxsize=None)
+@lru_cache(maxsize=1)
+def get_indicconformer():
+    """IndicConformer-600M-multilingual (ONNX). Its loader creates plain ONNX Runtime sessions; they are created here on
+    the GPU with a memory cap and the HEURISTIC cuDNN search (the default re-benchmarks every new input length)."""
+    import onnxruntime as ort
+    from huggingface_hub import snapshot_download
+    from transformers.dynamic_module_utils import get_class_from_dynamic_module
+    with MODEL_LOCK:
+        snapshot_download(INDICCONFORMER, local_dir=str(INDICCONFORMER_DIR))   # real files: ORT refuses cache symlinks
+        original = ort.InferenceSession
+        options = ort.SessionOptions()
+        options.intra_op_num_threads = 4
+        cuda = {"cudnn_conv_algo_search": "HEURISTIC", "gpu_mem_limit": int(ASR_GPU_MEM_GB * (1 << 30)),
+                "arena_extend_strategy": "kSameAsRequested"}
+        providers = [("CUDAExecutionProvider", cuda), "CPUExecutionProvider"] if DEVICE == "cuda" else ["CPUExecutionProvider"]
+        ort.InferenceSession = lambda path, *a, **kw: original(path, sess_options=options, providers=providers)
+        try:
+            model_cls = get_class_from_dynamic_module("model_onnx.IndicASRModel", INDICCONFORMER)
+            config_cls = get_class_from_dynamic_module("model_onnx.IndicASRConfig", INDICCONFORMER)
+            return model_cls(config_cls(ts_folder=str(INDICCONFORMER_DIR)))
+        finally:
+            ort.InferenceSession = original
+
+
+@lru_cache(maxsize=1)
+def get_whisper():
+    from transformers import pipeline
+    with MODEL_LOCK:
+        return pipeline("automatic-speech-recognition", model=ENGLISH_ASR, device=DEVICE,
+                        torch_dtype=torch.float16 if DEVICE == "cuda" else torch.float32)
+
+
+def main_asr_for(language):
+    """(engine, model name for the reports) of the main ASR of a language."""
+    if ASR_ENGINE == "best" and language in INDICCONFORMER_LANGS:
+        return "indicconformer", f"{INDICCONFORMER} ({INDICCONFORMER_DECODER.upper()})"
+    if ASR_ENGINE == "best" and language == "English":
+        return "whisper", ENGLISH_ASR
+    return "wav2vec", asr_model_for(language)
+
+
 def asr_model_for(language):
-    """First ASR candidate for the language that loads (ai4bharat ones fail until their terms are accepted)."""
+    """First wav2vec2 ASR candidate for the language that loads (ai4bharat ones fail until their terms are accepted)."""
     if language not in ASR_MODELS:
         raise ValueError(f"No ASR model configured for {language}; supported: {', '.join(ASR_MODELS)}")
     errors = []
@@ -259,23 +313,58 @@ def align_model_for(language):
     return ALIGN_MODEL if language == "Hindi" else asr_model_for(language)
 
 
-def transcribe_audio(audio_path, source_lang):
-    model_id = asr_model_for(source_lang)
-    processor, model = get_asr(model_id)
-    print(f"Transcribing {audio_path} using {model_id} on {DEVICE}")
-    audio_array = load_audio(audio_path)
-    words = []
-    for s, e in asr_chunks(audio_array):
-        piece = audio_array[int(s * SR):int(e * SR)]
-        if len(piece) < SR // 10:
-            continue
+def transcribe_pieces(pieces, source_lang, engine):
+    """Text of each speech chunk with one ASR engine: indicconformer, whisper or wav2vec. IndicConformer's RNNT decoder
+    returns nothing on some chunks (23 of 41 in the Gujarati file): those chunks get its CTC decoder's text, which
+    lowered the pooled WER of the 10 Indic reference files from 0.654 to 0.635 and was never worse by more than 0.003."""
+    if engine == "whisper":
+        with MODEL_LOCK:
+            out = get_whisper()([{"raw": p, "sampling_rate": SR} for p in pieces], batch_size=16,
+                                generate_kwargs={"language": "en", "task": "transcribe", "num_beams": 1})
+        return [" ".join(o["text"].split()) for o in out]
+    texts = []
+    if engine == "indicconformer":
+        model, code = get_indicconformer(), INDICCONFORMER_LANGS[source_lang]
+        for piece in pieces:
+            # no TorchScript fusion: with the CUDA 13 build of torch its NVRTC compile of the model's feature
+            # extractor fails ("identifier t0 is undefined"); unfused gives the same text
+            with MODEL_LOCK, torch.jit.optimized_execution(False):
+                x = torch.from_numpy(piece).unsqueeze(0)
+                text = str(model(x, code, INDICCONFORMER_DECODER)).strip()
+                if not text and INDICCONFORMER_DECODER != "ctc":
+                    text = str(model(x, code, "ctc")).strip()
+            texts.append(" ".join(text.split()))
+        return texts
+    processor, model = get_asr(asr_model_for(source_lang))
+    for piece in pieces:
         inputs = processor(piece, sampling_rate=SR, return_tensors="pt")
         with MODEL_LOCK, torch.no_grad():
             logits = model(inputs.input_values.to(DEVICE)).logits
             predicted_ids = torch.argmax(logits, dim=-1).cpu()
-        words += processor.batch_decode(predicted_ids, skip_special_tokens=True)[0].strip().split()
-    print("TRANSCRIPT:", words)
-    return " ".join(words)
+        texts.append(" ".join(processor.batch_decode(predicted_ids, skip_special_tokens=True)[0].split()))
+    return texts
+
+
+def transcribe_audio(audio_path, source_lang, second_opinion=False, chunks=False):
+    """Main ASR text of a file. second_opinion: also (wav2vec2 text, wav2vec2 model) when the main ASR is not wav2vec2;
+    chunks: also [(start s, end s, text)] per chunk. Every engine gets the same chunks: VAD speech regions merged into
+    <= ASR_CHUNK_S seconds."""
+    engine, name = main_asr_for(source_lang)
+    print(f"Transcribing {audio_path} using {name} on {DEVICE}")
+    audio_array = load_audio(audio_path)
+    spans = [(s, e) for s, e in asr_chunks(audio_array) if (e - s) * SR >= SR // 10]
+    pieces = [audio_array[int(s * SR):int(e * SR)] for s, e in spans]
+    texts = transcribe_pieces(pieces, source_lang, engine)
+    text = " ".join(t for t in texts if t)
+    if not second_opinion and not chunks:
+        return text
+    out = [text]
+    if second_opinion:
+        out.append((" ".join(t for t in transcribe_pieces(pieces, source_lang, "wav2vec") if t), asr_model_for(source_lang))
+                   if engine != "wav2vec" else None)
+    if chunks:
+        out.append([(round(s, 2), round(e, 2), t) for (s, e), t in zip(spans, texts)])
+    return tuple(out)
 
 
 def transcribe_folder_to_csv(folder_path: str, source_language: str):
@@ -287,7 +376,7 @@ def transcribe_folder_to_csv(folder_path: str, source_language: str):
         logging.info(f"Skipping transcription: File already exists at {output_path}")
         return output_path
 
-    results = []
+    results, second, chunk_rows = [], [], []
     for filename in sorted(os.listdir(folder_path)):
         audio_path = os.path.join(folder_path, filename)
         file_size = os.path.getsize(audio_path)
@@ -301,11 +390,19 @@ def transcribe_folder_to_csv(folder_path: str, source_language: str):
         transcribe_filename = filename
 
         try:
-            hypothesis = transcribe_audio(audio_path, source_language)
+            hypothesis, other, pieces = transcribe_audio(audio_path, source_language, second_opinion=True, chunks=True)
+            chunk_rows += [{"Filename": transcribe_filename, "Chunk": i, "Start_s": s, "End_s": e, "Text": t}
+                           for i, (s, e, t) in enumerate(pieces)]
             results.append({
                 "Filename": transcribe_filename,
                 "Indiconformer_Hypothesis": hypothesis
             })
+            if other:   # how much a second ASR disagrees: a quality signal that needs no reference
+                import jiwer
+                a, b = " ".join(hypothesis.split()), " ".join(other[0].split())
+                second.append({"Filename": transcribe_filename, "Main_ASR_Model": main_asr_for(source_language)[1],
+                               "Second_ASR_Model": other[1], "Second_Hypothesis": other[0],
+                               "ASR_Disagreement": round(jiwer.wer(a, b), 4) if a and b else None})
             logging.info(f"Transcribed {transcribe_filename}: {hypothesis[:50]}...")
         except Exception as e:
             logging.error(f"Failed to transcribe {transcribe_filename}: {e}")
@@ -316,6 +413,10 @@ def transcribe_folder_to_csv(folder_path: str, source_language: str):
 
     df = pd.DataFrame(results)
     df.to_csv(output_path, index=False)
+    if second:
+        pd.DataFrame(second).to_csv(os.path.join(os.path.dirname(output_path), "asr_second_opinion.csv"), index=False)
+    # per chunk: the LLM judge (task 17) rates chunks, and segment-level checks can find where a file goes wrong
+    pd.DataFrame(chunk_rows).to_csv(os.path.join(os.path.dirname(output_path), "asr_chunks.csv"), index=False)
     logging.info(f"Transcriptions saved to {output_path}")
     return output_path
 
@@ -396,7 +497,9 @@ def get_diarization_pipeline():
 
 
 def diarize(audio):
-    """Returns {local_label: (seconds, unit-norm speaker embedding)} for one file."""
+    """Returns ({local_label: (seconds, unit-norm speaker embedding)}, seconds with speech) for one file. A speaker's
+    seconds include the time they talk over someone else, so the speakers' seconds can add up to more than the speech
+    (and, with much cross-talk, more than the file)."""
     if SPEECH_BACKEND == "pyannote":
         return diarize_pyannote(audio)
     return diarize_local(audio)
@@ -414,7 +517,7 @@ def diarize_pyannote(audio):
         # very short speakers get no embedding (NaN): still counted, never matched across files
         ok = e is not None and np.isfinite(e).all() and np.linalg.norm(e) > 0
         result[label] = (secs, e / np.linalg.norm(e) if ok else None)
-    return result
+    return result, float(ann.get_timeline().support().duration())
 
 
 def diarize_local(audio):
@@ -433,7 +536,7 @@ def diarize_local(audio):
         windows += seg
         owned += [bounds[k + 1] - bounds[k] for k in range(len(seg))]
     if not windows:
-        return {}
+        return {}, 0.0
     emb = embed_windows(audio, windows)
     owned = np.array(owned)
     if len(windows) == 1:
@@ -450,48 +553,102 @@ def diarize_local(audio):
     for c in sorted(set(labels)):
         cent = emb[labels == c].mean(0)
         result[c] = (float(owned[labels == c].sum()), cent / np.linalg.norm(cent))
-    return result
+    return result, float(owned.sum())   # windows own disjoint stretches: no overlap
+
+
+def load_speaker_db():
+    """Speakers of earlier batches: embeddings with their global ID, file (md5, fname) and batch. None when off.
+    (No key may be called "file": np.savez takes that name for its own first argument.)"""
+    if SPEAKER_DB.lower() == "none":
+        return None
+    path = os.path.join(SPEAKER_DB, "speakers.npz")
+    if not os.path.isfile(path):
+        return {"emb": np.zeros((0, 0), np.float32), "id": np.zeros(0, int), "md5": np.array([], str),
+                "fname": np.array([], str), "batch": np.array([], str), "backend": np.array([], str)}
+    with np.load(path, allow_pickle=False) as d:
+        return {k: d[k] for k in d.files}
+
+
+def save_speaker_db(db):
+    os.makedirs(SPEAKER_DB, exist_ok=True)
+    tmp = os.path.join(SPEAKER_DB, "speakers.tmp.npz")
+    np.savez(tmp, **db)
+    os.replace(tmp, os.path.join(SPEAKER_DB, "speakers.npz"))
 
 
 def save_num_speakers(folder_path: str) -> str:
-    """Per-file speaker count and durations. Speaker IDs are global across the folder: a voice that
-    matches one heard in an earlier file gets the same SPEAKER_xx, so the new/old check is meaningful."""
+    """Per-file speaker count and durations. Speaker IDs are global: a voice that matches one heard in an earlier file
+    of this folder, or in an earlier batch (SPEAKER_DB), gets the same SPEAKER_xx, so the new/old check (task 12) is
+    meaningful across batches. Re-running a file replaces what the database held for it (matched by content)."""
+    from duplicates import file_md5
     parent = os.path.dirname(folder_path.rstrip("/\\"))
     output_csv = os.path.join(parent, 'results', "num_speakers.csv")
     os.makedirs(os.path.dirname(output_csv), exist_ok=True)
     if os.path.exists(output_csv):
         logging.info(f"Skipping speaker number calculation: File already exists at {output_csv}")
         return output_csv
-    registry = []   # global speaker centroids
+    files = [f for f in sorted(os.listdir(folder_path)) if f.lower().endswith((".wav", ".mp3", ".flac"))]
+    md5 = {f: file_md5(os.path.join(folder_path, f)) for f in files}
+    db = load_speaker_db()
+    registry, earlier = [], {}   # registry: (global id, embedding); earlier: global id -> ["batch/file", ...]
+    next_id = 0
+    if db is not None and len(db["id"]):
+        keep = ~np.isin(db["md5"], list(md5.values()))   # these files again: forget their earlier entries
+        db = {k: v[keep] for k, v in db.items()}
+        next_id = int(db["id"].max()) + 1 if len(db["id"]) else 0
+        for k, e, b, f, backend in zip(db["id"], db["emb"], db["batch"], db["fname"], db["backend"]):
+            if backend == SPEECH_BACKEND:
+                registry.append((int(k), e))
+                earlier.setdefault(int(k), []).append(f"{b}/{f}")
+    new_rows = []
+    batch = os.path.basename(os.path.dirname(parent)) + "/" + os.path.basename(parent)
     try:
         with open(output_csv, mode='w', newline='') as file:
             writer = csv.writer(file)
-            writer.writerow(["File Name", "Number of Speakers", "Speaker Durations"])
-            for filename in sorted(os.listdir(folder_path)):
-                if filename.lower().endswith((".wav", ".mp3", ".flac")):
-                    audio_path = os.path.join(folder_path, filename)
-                    try:
-                        local = diarize(load_audio(audio_path))
-                        speaker_durations, used = {}, set()
-                        for _, (secs, cent) in sorted(local.items(), key=lambda kv: -kv[1][0]):
-                            sims = [] if cent is None else [(float(cent @ g), k) for k, g in enumerate(registry)
-                                                            if k not in used and g is not None]
-                            best = max(sims, default=(-1.0, None))
-                            if best[0] >= SPEAKER_MATCH_THRESHOLD:
-                                k = best[1]
-                            else:
-                                registry.append(cent)
-                                k = len(registry) - 1
-                            used.add(k)
-                            speaker_durations[f"SPEAKER_{k:02d}"] = round(secs / 3600, 4)
-                        speaker_durations_json = json.dumps(speaker_durations)
-                        writer.writerow([filename, len(speaker_durations), speaker_durations_json])
-                        print(f"Processed {filename}: {len(speaker_durations)} unique speakers, Durations: {speaker_durations_json}")
-                    except Exception as e:
-                        print(f"Error processing {filename}: {e}")
-                        writer.writerow([filename, "Error", f"Error: {e}"])
+            writer.writerow(["File Name", "Number of Speakers", "Speaker Durations", "Speech (s)", "Overlap (s)",
+                             "Earlier Batches"])
+            for filename in files:
+                audio_path = os.path.join(folder_path, filename)
+                try:
+                    local, speech = diarize(load_audio(audio_path))
+                    speaker_durations, used, seen_before = {}, set(), {}
+                    for _, (secs, cent) in sorted(local.items(), key=lambda kv: -kv[1][0]):
+                        sims = [] if cent is None else [(float(cent @ g), k) for k, g in registry
+                                                        if k not in used and g is not None and g.shape == cent.shape]
+                        best = max(sims, default=(-1.0, None))
+                        if best[0] >= SPEAKER_MATCH_THRESHOLD:
+                            k = best[1]
+                        else:
+                            k, next_id = next_id, next_id + 1
+                        if cent is not None:
+                            registry.append((k, cent))
+                            new_rows.append((k, cent, md5[filename], filename))
+                        used.add(k)
+                        name = f"SPEAKER_{k:02d}"
+                        speaker_durations[name] = round(secs / 3600, 4)
+                        if k in earlier:
+                            seen_before[name] = sorted(set(earlier[k]))[:5]
+                    overlap = max(0.0, sum(v[0] for v in local.values()) - speech)
+                    writer.writerow([filename, len(speaker_durations), json.dumps(speaker_durations), round(speech, 1),
+                                     round(overlap, 1), json.dumps(seen_before, ensure_ascii=False)])
+                    print(f"Processed {filename}: {len(speaker_durations)} speakers, {speaker_durations}")
+                except Exception as e:
+                    print(f"Error processing {filename}: {e}")
+                    writer.writerow([filename, "Error", f"Error: {e}", None, None, None])
+        if db is not None and new_rows:
+            dim = new_rows[0][1].shape[0]
+            old = len(db["id"]) and db["emb"].shape[1] == dim
+            db = {"emb": np.vstack(([db["emb"]] if old else []) + [np.stack([r[1] for r in new_rows])]).astype(np.float32),
+                  "id": np.concatenate([db["id"] if old else np.zeros(0, int), [r[0] for r in new_rows]]),
+                  "md5": np.concatenate([db["md5"] if old else np.array([], str), [r[2] for r in new_rows]]),
+                  "fname": np.concatenate([db["fname"] if old else np.array([], str), [r[3] for r in new_rows]]),
+                  "batch": np.concatenate([db["batch"] if old else np.array([], str), [batch] * len(new_rows)]),
+                  "backend": np.concatenate([db["backend"] if old else np.array([], str), [SPEECH_BACKEND] * len(new_rows)])}
+            save_speaker_db(db)
         return f"CSV saved at: {output_csv}"
     except Exception as e:
+        if os.path.exists(output_csv):   # a partial table would be reused by the next run
+            os.remove(output_csv)
         return f"Error writing to CSV: {e}"
 
 
@@ -722,51 +879,104 @@ def process_audio_directory(audio_dir, transcript_csv, output_csv_path=None, lan
 
 
 # ---------------------------------------------------------------- upsampling
-def is_upsampled_from_8k_v2(audio_path, threshold_ratio=0.02):
-    """True if a file stored above 8 kHz carries (almost) no energy between 4 and 8 kHz, i.e. narrowband audio
-    upsampled to a higher rate. Measured at the file's own rate: a native 8 kHz file is not upsampled (the sample
-    rate check reports it), and resampling it to 16 kHz first would make every such file look upsampled."""
-    try:
-        waveform, native_sr = librosa.load(audio_path, sr=None, mono=True)
-    except Exception as e:
-        print(f"Encountered an error loading file {audio_path}")
-        print(f"ERROR: {e}")
-        return False
-    if native_sr <= 8000:
-        return False
-    spectrum = np.abs(np.fft.rfft(waveform))
-    freqs = np.fft.rfftfreq(len(waveform), 1 / native_sr)
-    total_energy = np.sum(spectrum)
-    high_freq_band = (freqs >= 4000) & (freqs <= 8000)
-    high_freq_energy = np.sum(spectrum[high_freq_band])
-    ratio = high_freq_energy / total_energy
-    return bool(ratio < threshold_ratio)
+STANDARD_RATES = (8000, 11025, 16000, 22050, 24000, 32000, 44100, 48000, 96000)
+
+
+def effective_bandwidth(audio_path, floor_db=50.0):
+    """(stored sample rate, bandwidth in Hz, estimated original rate). The bandwidth is the highest frequency whose
+    long-term level is within floor_db of the speech band (300-3000 Hz); audio resampled up from a lower rate has
+    nothing above the old Nyquist frequency (its anti-alias filter). The original rate is the lowest standard rate
+    that holds that bandwidth: 8 kHz telephone audio stored at 48 kHz gives (48000, ~3500, 8000)."""
+    from scipy.signal import medfilt, welch
+    y, sr = librosa.load(audio_path, sr=None, mono=True, duration=600)
+    freqs, power = welch(y, sr, nperseg=4096)
+    db = 10 * np.log10(power + 1e-20)
+    db = medfilt(db, 2 * int(100 / (freqs[1] - freqs[0])) + 1)   # ~200 Hz median: single tones do not count
+    ref = np.percentile(db[(freqs >= 300) & (freqs <= 3000)], 90)
+    above = np.nonzero(db > ref - floor_db)[0]
+    bandwidth = float(freqs[above[-1]]) if len(above) else 0.0
+    original = next((r for r in STANDARD_RATES if r / 2 >= bandwidth * 0.98), sr)
+    return int(sr), round(bandwidth), int(min(original, sr))
 
 
 def check_upsampling_folder(folder_path: str):
+    """Per file: stored rate, bandwidth and estimated original rate; upsampled when the original rate is lower than
+    the stored one (any rate, not only 8 kHz). A file stored at its own low rate (8 kHz) is not upsampled: the sample
+    rate check reports it."""
     results = []
     for filename in sorted(os.listdir(folder_path)):
-        if filename.lower().endswith((".wav", ".mp3")):
-            audio_path = os.path.join(folder_path, filename)
+        if filename.lower().endswith((".wav", ".mp3", ".flac")):
             try:
-                is_upsampled = is_upsampled_from_8k_v2(audio_path)
-                results.append({
-                    "Filename": filename,
-                    "Is_Upsampled": is_upsampled
-                })
-                print(f"Processed: {filename}, Upsampled: {is_upsampled}")
+                sr, bandwidth, original = effective_bandwidth(os.path.join(folder_path, filename))
+                results.append({"Filename": filename, "Sample_Rate": sr, "Bandwidth_Hz": bandwidth,
+                                "Estimated_Original_Rate": original, "Is_Upsampled": original < sr})
+                print(f"Processed: {filename}, {sr} Hz stored, bandwidth {bandwidth} Hz, original ~{original} Hz")
             except Exception as e:
                 print(f"Error processing {filename}: {e}")
-                results.append({
-                    "Filename": filename,
-                    "Is_Upsampled": "Error"
-                })
-    df = pd.DataFrame(results)
+                results.append({"Filename": filename, "Is_Upsampled": "Error"})
     parent = os.path.dirname(folder_path.rstrip("/\\"))
     os.makedirs(os.path.join(parent, 'results'), exist_ok=True)
     output_path = os.path.join(parent, 'results', "upsampling_check.csv")
-    df.to_csv(output_path, index=False)
+    pd.DataFrame(results).to_csv(output_path, index=False)
     return f"CSV saved at: {output_path}"
+
+
+# ---------------------------------------------------------------- audio language ID
+MMS_TO_ISO1 = {"hin": "hi", "ben": "bn", "tam": "ta", "tel": "te", "mar": "mr", "guj": "gu", "kan": "kn", "mal": "ml",
+               "ory": "or", "pan": "pa", "urd": "ur", "asm": "as", "npi": "ne", "nep": "ne", "san": "sa", "eng": "en"}
+
+
+@lru_cache(maxsize=1)
+def get_mms_lid():
+    from transformers import AutoFeatureExtractor, Wav2Vec2ForSequenceClassification
+    with MODEL_LOCK:
+        name = AUDIO_LID_MODELS[1]
+        return AutoFeatureExtractor.from_pretrained(name), Wav2Vec2ForSequenceClassification.from_pretrained(name).to(DEVICE).eval()
+
+
+def whisper_language(x):
+    from transformers.models.whisper.tokenization_whisper import LANGUAGES
+    pipe = get_whisper()
+    model, tok = pipe.model, pipe.tokenizer
+    codes = list(LANGUAGES)
+    ids = torch.tensor(tok.convert_tokens_to_ids([f"<|{c}|>" for c in codes]), device=model.device)
+    feats = pipe.feature_extractor(x, sampling_rate=SR, return_tensors="pt").input_features.to(model.device, model.dtype)
+    with MODEL_LOCK, torch.no_grad():
+        enc = model.model.encoder(feats).last_hidden_state
+        start = torch.tensor([[model.config.decoder_start_token_id]], device=model.device)
+        logits = model.proj_out(model.model.decoder(input_ids=start, encoder_hidden_states=enc).last_hidden_state)[0, -1]
+    p = torch.softmax(logits[ids].float(), -1)
+    i = int(p.argmax())
+    return codes[i], float(p[i])
+
+
+def mms_language(x):
+    fe, model = get_mms_lid()
+    inputs = fe(x, sampling_rate=SR, return_tensors="pt").to(DEVICE)
+    with MODEL_LOCK, torch.no_grad():
+        p = torch.softmax(model(**inputs).logits[0].float(), -1)
+    i = int(p.argmax())
+    label = model.config.id2label[i]
+    return MMS_TO_ISO1.get(label, label), float(p[i])
+
+
+def audio_language(audio_path, seconds=30):
+    """Spoken language from the audio itself (no transcript): Whisper-large-v3 and MMS-LID-126 each hear the first
+    `seconds` of speech, and the more confident one wins. Returns a dict with both answers."""
+    audio = load_audio(audio_path)
+    parts, n = [], 0
+    for s, e in speech_regions(audio):
+        parts.append(audio[int(s * SR):int(e * SR)])
+        n += len(parts[-1])
+        if n >= seconds * SR:
+            break
+    x = (np.concatenate(parts) if parts else audio)[:seconds * SR]
+    w, wp = whisper_language(x)
+    m, mp = mms_language(x)
+    code, conf, model = (w, wp, "Whisper") if wp >= mp else (m, mp, "MMS-LID")
+    return {"Audio_Language": LANG_CODES.get(code, code), "Audio_Confidence": round(conf, 3), "Audio_LID_Model": model,
+            "Whisper_Language": LANG_CODES.get(w, w), "Whisper_Confidence": round(wp, 3),
+            "MMS_Language": LANG_CODES.get(m, m), "MMS_Confidence": round(mp, 3)}
 
 
 # ---------------------------------------------------------------- IndicLID
@@ -938,5 +1148,7 @@ def get_required_inputs(task_id: int) -> list[str]:
         22: ["audio_dir"],
         23: ["audio_dir"],
         24: ["audio_dir"],
+        25: ["audio_dir"],
+        26: ["audio_dir"],
     }
     return input_requirements.get(task_id, [])

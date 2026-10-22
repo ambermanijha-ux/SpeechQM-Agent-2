@@ -43,6 +43,13 @@ def transcript_text(json_path: Path) -> str:
                     if s["text"].strip())
 
 
+def transcript_segments(json_path: Path) -> list:
+    """(start, end, speaker, text) of every segment, for the timestamp segmentation (task 25)."""
+    segments = json.loads(json_path.read_text(encoding="utf-8"))["segments"]
+    return [(float(s["start_time"]), float(s["end_time"]), (s.get("speaker") or {}).get("id", ""), " ".join(s["text"].split()))
+            for s in sorted(segments, key=lambda s: s["start_time"])]
+
+
 def transcript_for(audio: Path, jsons) -> Path:
     """The transcript JSON of an audio file: same folder, same stem (hi001.json), else a name containing the stem
     as a whole token (Copy of hi001_human_transcribed.json; sample_1 does not match sample_10_x.json)."""
@@ -72,7 +79,7 @@ def main(src: Path, out: Path, default_language=None) -> dict:
     for lang, files in sorted(audio.items()):
         dest = out / lang / "audios"
         dest.mkdir(parents=True, exist_ok=True)
-        rows, names = [], set()
+        rows, seg_rows, names = [], [], set()
         for f in files:
             if f.name in names:
                 raise ValueError(f"two {lang} files are named {f.name}; rename one first")
@@ -86,6 +93,7 @@ def main(src: Path, out: Path, default_language=None) -> dict:
             if transcript:
                 try:
                     rows.append((f.name, transcript_text(transcript)))
+                    seg_rows += [(f.name, *seg) for seg in transcript_segments(transcript)]
                 except (ValueError, KeyError, TypeError, AttributeError) as e:
                     print(f"  skipped transcript {transcript.name}: not the expected segments JSON ({e})")
         for old in dest.iterdir():   # files removed from the source since an earlier run
@@ -94,11 +102,16 @@ def main(src: Path, out: Path, default_language=None) -> dict:
         res = out / lang / "results"
         res.mkdir(exist_ok=True)
         (res / "indicconf_hypothesis-gt.csv").unlink(missing_ok=True)
+        (res / "reference_segments.csv").unlink(missing_ok=True)
         if rows:
             with open(res / "indicconf_hypothesis-gt.csv", "w", newline="", encoding="utf-8") as fh:
                 w = csv.writer(fh)
                 w.writerow(["filename", "ground_truth"])
                 w.writerows(rows)
+            with open(res / "reference_segments.csv", "w", newline="", encoding="utf-8") as fh:
+                w = csv.writer(fh)
+                w.writerow(["filename", "start", "end", "speaker", "text"])
+                w.writerows(seg_rows)
         print(f"{lang:10} {len(files):3} audio, {len(rows):3} with transcript -> {out / lang}")
     return {lang: out / lang for lang in sorted(audio)}
 

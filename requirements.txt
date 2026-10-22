@@ -1,8 +1,11 @@
 # SpeechQM-Agent, Python 3.11, Mac / Windows / Linux. Install with the setup script (setup.sh / setup.ps1), which
 # uses uv's --torch-backend=auto to pick the CUDA build of torch when an NVIDIA GPU is present (else CPU / Apple MPS).
-torch==2.14.1
+# torch pinned to torchaudio's version: torchaudio stopped at 2.11, and a newer torch ran with the CPU build of
+# torchaudio (its compiled ops do not load)
+torch==2.11.0
 torchaudio==2.11.0
 transformers==4.57.6
+regex==2026.9.29   # \p{L}/\p{M} classes for scripts the code-writing LLM generates
 huggingface_hub==0.36.2
 librosa==0.11.0
 soundfile==0.14.0
@@ -19,3 +22,5 @@ langchain-ollama==0.3.10
 langgraph==0.6.11
 grandalf==0.8
 pyannote.audio==4.0.7
+onnxruntime-gpu==1.31.0; sys_platform != "darwin"   # IndicConformer (main ASR); CUDA when an NVIDIA GPU is present
+onnxruntime==1.31.0; sys_platform == "darwin"

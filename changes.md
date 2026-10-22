@@ -116,17 +116,19 @@ with the fallbacks.
 | Transliteration (18) | never received the reference CSV from `run_qc.py`; asking the LLM to rewrite whole transcripts did not finish (> 14 min); English and Odia rejected | reads `results/indicconf_hypothesis-gt.csv`; LLM maps only Roman words (JSON, validated script); all Indic languages; English skipped |
 | Word splitting (5, 6, 9, 24) | contractions split in two ("don't" → "don", "t"), overcounting English words by ~4 % | apostrophes/hyphens inside a word keep it one word |
 | Code-writing agent | qwen3:8b mis-copied a long path (two characters dropped) in all 3 attempts | `fix_paths` replaces near-miss path literals with the real path |
-| Prompt checker | added unrequested tasks (29 % of planned actions on an 18-query benchmark) | its additions are ignored; it can only remove (6 %) |
-| LLM score (17) | the judge gave ASR transcripts and the same words shuffled the same score | gated: scored only when transcript quality passes, ASR alignment ≥ 0.5 and IndicBERTv2 pseudo-perplexity ≤ 150 (calibrated: human references 10-53, shuffled 397-1512); otherwise empty with the reason |
+| Prompt checker | added unrequested tasks (29 % of planned actions on an 18-query benchmark) | its additions were ignored (6 %). **Reverted 2026-10-22** on request: its verified list is the plan again, as in the paper; additions are recorded in `results/plan.json` |
+| LLM score (17) | the judge gave ASR transcripts and the same words shuffled the same score | a fluency gate was added. **Reverted 2026-10-22** on request (every transcript scored, as in the paper); per-chunk scores were added instead (section 9) |
 | Transliteration (18) | one LLM answer per word could be wrong but plausible | converted only when two differently worded LLM runs agree and, when available, IndicXlit lists the same spelling in its top 5 (`docker/indicxlit` for Mac/Windows); per-word decisions in `transliteration_words.csv` |
 
 ## 7. Unchanged on purpose
 
 - The 24 checks, their numbering and the LangGraph orchestration (planner → prompt checker → DAG → parallel execution).
-  The default run (`run_qc.py` without `--prompt`) requests all 24 (18 needs reference transcripts and an Indic
-  language; 9, 16, 23, 24 need reference transcripts).
-- SpeechQM's file rules: only `.wav` passes the extension check and `.mp3` is reported as corrupt; 16 kHz is the
-  expected sample rate.
+  Two checks were added as 25 and 26 (section 9). The default run (`run_qc.py` without `--prompt`) requests all 26
+  (18 needs reference transcripts and an Indic language; 9, 16, 24, 25, 26 need reference transcripts).
+- SpeechQM's file rules: only `.wav` passes the extension check and `.mp3` is reported as corrupt. The sample rate
+  is reported, not judged (2026-10-22).
+- The LLM writes the code of 7 checks at run time (corruption, extension, sample rate, audio length, character list,
+  normalization, alignment); its outputs are validated, not replaced by fixed code.
 - Output CSV names and columns of each check (some gained columns, none lost).
 - `llm.py` still works as the original prompt-driven entry point (`PROMPT` in `my_secrets.py`).
 
@@ -136,3 +138,29 @@ with the fallbacks.
 - `.gitignore`: `.venv/`, `models/`, `pipeline.log`, `__pycache__/`, `log.txt`, `*_qc/`; `.gitattributes` for line endings.
 - `env/denv.yml`: line endings only (CRLF → LF); content unchanged.
 - `my_secrets.py`: example prompt updated; no keys stored.
+
+## 9. 2026-10-22: Azure VM, new checks and the gaps closed
+
+Measured before keeping: every change to a prompt or model below was compared on a benchmark in `../qc_audit/`
+(outside the repository). The numbers are from those benchmarks.
+
+| Area | Change | Evidence |
+|---|---|---|
+| Settings | `.env` (git-ignored) read by `config.load_dotenv()`: `HF_TOKEN`, models. `JUDGE_MODEL`, `MONITOR_MODEL`, `CODER_MAX_TOKENS`, `ASR_ENGINE`, `SPEAKER_DB`, `PUBLIC_INDEX`, `REPLAN` | |
+| Code-writing agent | every generated CSV checked per task (exact file list, no blanks, values that match the files); the output is deleted when all tries fail; reply length capped | all 7 generated checks pass within 3 tries |
+| Tool library | scripts that passed their checks are kept in `tool_library/` and run only when every new attempt fails (the LLM still writes code on every run) | |
+| Monitoring LLM (paper §2.4) | reviews every step's status and output with computed facts; LLM-written steps re-run once on RETRY. Missing files, repeated rows and empty columns in LLM-written outputs are decided without the LLM | broken outputs caught 49/64 → 64/64, false alarms 3/246 both (`monitor_bench.py`) |
+| Re-planning | steps that failed or that the monitor wanted re-run (RETRY) go back to the planner, which picks those to run once more (`results/replan_log.csv`) | |
+| Plan record | `results/plan.json`: what the planner selected, what the checker, keywords and dependencies added, what was skipped | |
+| ASR | IndicConformer-600M (RNNT) for 14 Indic languages, Whisper-large-v3 for English; wav2vec2 kept as second opinion (`ASR_Disagreement`), for CTC and alignment. Chunks RNNT leaves empty get the CTC decoder's text | pooled WER 0.857 → 0.659 → 0.635 (chunk fallback; Gujarati 0.88 → 0.83) |
+| Audio language ID (15) | Whisper-large-v3 and MMS-LID-126 on 30 s of speech, the more confident wins, next to IndicLID on the text | 172/180 labelled public clips (Whisper alone 154, MMS 165); 19/22 files of our data |
+| Upsampling (11) | effective bandwidth → estimated original rate (any standard rate, not only 8 kHz) | synthetic 8→16, 11.025→16, 16→22.05/44.1/48 kHz all correct |
+| Speakers (2, 12, 22) | speech time and overlap per file; speakers remembered across batches (`speaker_db/`); re-running a file replaces its entries | |
+| Domain (13) | label definitions for the confusable labels, reference text when present, text capped at 3000 characters with the instruction repeated after it (a long Kannada text pushed the instructions out of the context) | 45/66 → 60/66 (`domain_bench.py`, 22 files × 3) |
+| LLM judge (17) | per-file score as in the paper, plus 0-10 scores for up to 30 ASR chunks per file | Spearman with file WER: per-file score +0.10, chunk score −0.58 (`judge_bench.py`) |
+| Duplicates (23) | near-duplicate utterances (character 3-gram TF-IDF), shared audio (landmark fingerprints: re-encoded, noisy, trimmed and embedded copies), public corpora (`build_corpus_index.py`); runs without references too | no false audio matches among the 22 files; all 6 altered copies found |
+| WER (24) | CER, second ASR's WER, and WER per reference utterance (with and without cross-talk) | |
+| Timestamp segmentation (25, new) | each reference utterance cut out and aligned; time-stamp issues (inverted, beyond the audio, same-speaker overlap, > 30 s) | |
+| Code-mixing (26, new) | script per word, Code-Mixing Index per utterance and file, other scripts in the reference | found Cyrillic look-alike letters in two references |
+| Dashboard | `dashboard.html` next to `qc_summary.csv` | |
+| Environment | torch pinned to 2.11.0, the version of the last torchaudio (2.14 ran with the CPU build of torchaudio); `onnxruntime-gpu`, `regex` | |
