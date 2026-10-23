@@ -86,6 +86,22 @@ INDICCONFORMER_LANGS = {"Hindi": "hi", "Bengali": "bn", "Tamil": "ta", "Telugu":
                         "Urdu": "ur", "Nepali": "ne", "Sanskrit": "sa"}
 ENGLISH_ASR = os.environ.get("ENGLISH_ASR", "openai/whisper-large-v3")
 ASR_GPU_MEM_GB = float(os.environ.get("ASR_GPU_MEM_GB", "12"))   # ONNX Runtime arena cap (GPUs shared with Ollama)
+# MoE score (task 3; the paper's "WER/CER across several ASR models"): next to the main ASR, these ASR "experts"
+# transcribe every file, and how far the main transcript is from the experts scores it without a reference.
+# Indic: Bodhan Indic-Transcribe-Flex + the wav2vec2 model; English: NVIDIA Nemotron, Bodhan (Indian-accented
+# English) + the wav2vec2 model.
+# MOE_EXPERTS picks from bodhan, nemotron, wav2vec2 ("none": main ASR only).
+MOE_EXPERTS = [e.strip() for e in os.environ.get("MOE_EXPERTS", "bodhan,nemotron,wav2vec2").split(",")
+               if e.strip() and e.strip() != "none"]
+BODHAN_ASR = "bodhan-ai/indic-transcribe-flex"   # gated: accept its terms on Hugging Face
+BODHAN_DIR = MODELS_DIR / "indic-transcribe-flex"
+NEMOTRON_ASR = os.environ.get("NEMOTRON_ASR", "nvidia/nemotron-speech-streaming-en-0.6b")
+# Nemotron needs transformers >= 5.13 (the main .venv has 4.57): it runs in this venv as nemotron_worker.py
+NEMOTRON_PYTHON = os.environ.get("NEMOTRON_PYTHON") or str(HERE / ".venv-nemotron" /
+                                                            ("Scripts/python.exe" if os.name == "nt" else "bin/python"))
+EXPERT_CHUNK_S = 25.0   # the experts get speech chunks of up to 25 s (Bodhan trains on <= 30 s; shorter costs it WER)
+# task 3 fails a transcript when even the closest expert differs on more than this share of its characters
+MOE_MAX_CER = float(os.environ.get("MOE_MAX_CER", "0.5"))
 # Audio language ID (task 15, next to IndicLID on the text): both models hear up to 30 s of speech and the more
 # confident one wins (qc_audit/lid_bench: 172/180 labelled public clips, vs 154 Whisper and 165 MMS alone)
 AUDIO_LID_MODELS = ("openai/whisper-large-v3", "facebook/mms-lid-126")

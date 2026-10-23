@@ -14,6 +14,9 @@ echo "Creating .venv (Python 3.11) and installing packages ..."
 uv venv -p 3.11 --allow-existing .venv
 # auto: the CUDA build of torch on machines with an NVIDIA GPU, CPU build otherwise (Apple GPU works with the default)
 uv pip install --python .venv/bin/python --torch-backend=auto -r requirements.txt
+echo "Creating .venv-nemotron for the Nemotron ASR expert (needs a newer transformers) ..."
+uv venv -p 3.11 --allow-existing .venv-nemotron
+uv pip install --python .venv-nemotron/bin/python --torch-backend=auto -r requirements-nemotron.txt
 
 # OLLAMA_BASE_URL set = an Ollama server elsewhere (another machine / the host of a container): nothing to install
 if [ -z "${OLLAMA_BASE_URL:-}" ] && ! command -v ollama >/dev/null 2>&1 && [ ! -d /Applications/Ollama.app ]; then

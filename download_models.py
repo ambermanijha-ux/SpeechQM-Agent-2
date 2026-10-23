@@ -16,7 +16,7 @@ from huggingface_hub.errors import HfHubHTTPError
 
 from config import (ASR_MODELS, ALIGN_MODEL, INDICBERT_TOKENIZER, INDICLID_DIR, OLLAMA_BASE_URL, PLANNER_MODEL, JUDGE_MODEL, MONITOR_MODEL,
                     ASR_ENGINE, INDICCONFORMER, INDICCONFORMER_LANGS, ENGLISH_ASR, AUDIO_LID_MODELS,
-                    CODER_MODEL)
+                    CODER_MODEL, MOE_EXPERTS, BODHAN_ASR, NEMOTRON_ASR, NEMOTRON_PYTHON)
 
 INDICLID_URL = "https://github.com/AI4Bharat/IndicLID/releases/download/v1.0/"
 INDICLID = {"indiclid-ftn": "model_baseline_roman.bin", "indiclid-ftr": "model_baseline_roman.bin",
@@ -92,6 +92,18 @@ def ensure_hf(languages, speech_backend="pyannote"):
     if ASR_ENGINE == "best" and "English" in languages:
         print(f"hf: {ENGLISH_ASR} (English ASR, ~3 GB)")
         snapshot_download(ENGLISH_ASR, allow_patterns=HF_WEIGHTS)
+    # ASR experts of the MoE score (task 3); one that cannot be downloaded only leaves the score with fewer models
+    if "bodhan" in MOE_EXPERTS and any(lang in INDICCONFORMER_LANGS or lang == "English" for lang in languages):
+        if has_access(BODHAN_ASR):
+            print(f"hf: {BODHAN_ASR} (MoE expert, ~4.6 GB)")
+            U.get_bodhan()
+        else:
+            print(f"  skipped {BODHAN_ASR}: accept its terms on Hugging Face to use it as an MoE expert")
+    if "nemotron" in MOE_EXPERTS and "English" in languages:
+        print(f"hf: {NEMOTRON_ASR} (MoE expert, ~2.5 GB)")
+        snapshot_download(NEMOTRON_ASR, allow_patterns=HF_WEIGHTS)
+        if not Path(NEMOTRON_PYTHON).is_file():
+            print(f"  {NEMOTRON_PYTHON} not found: set up the Nemotron venv (README, 'MoE experts')")
     for repo in AUDIO_LID_MODELS:   # audio language ID (task 15): Whisper-large-v3 ~3 GB, MMS-LID-126 ~3.9 GB
         print(f"hf: {repo} (audio language ID)")
         snapshot_download(repo, allow_patterns=HF_WEIGHTS)

@@ -164,3 +164,14 @@ Measured before keeping: every change to a prompt or model below was compared on
 | Code-mixing (26, new) | script per word, Code-Mixing Index per utterance and file, other scripts in the reference | found Cyrillic look-alike letters in two references |
 | Dashboard | `dashboard.html` next to `qc_summary.csv` | |
 | Environment | torch pinned to 2.11.0, the version of the last torchaudio (2.14 ran with the CPU build of torchaudio); `onnxruntime-gpu`, `regex` | |
+
+## 10. 2026-10-23: MoE score (several ASR models per file)
+
+| Area | Change | Evidence |
+|---|---|---|
+| ASR experts (1) | every file is also transcribed by `bodhan-ai/indic-transcribe-flex` (all 14 Indic languages and English), `nvidia/nemotron-speech-streaming-en-0.6b` (English; in `.venv-nemotron` via `nemotron_worker.py`, it needs transformers ≥ 5.13) and the wav2vec2 model; `asr_experts.csv`, `asr_moe.csv` replace `asr_second_opinion.csv` (`ASR_Disagreement` in §9 is superseded). `MOE_EXPERTS`, `MOE_MAX_CER` | added without an ASR benchmark (user decision); WER on the 11 reference files: Bodhan 0.624, main 0.671, Nemotron 0.620 (en001), wav2vec2 0.867 |
+| Transcript quality (3) | also fails when even the closest expert differs from the main transcript on > 50 % of the characters | 5 new failures in `audios_qc_moe/`, each a real problem (English audio, dropped speech, suspected wrong language); `Main_Agreement_CER` vs WER Spearman 0.66 |
+| WER (24) | WER and CER of every expert (`WER_bodhan`, `WER_nemotron`, `WER_wav2vec2`) | |
+| MoE score | pairwise differences capped at 1 (a model that drops most speech gave 3.5) | |
+| Setup | `requirements-nemotron.txt`; `setup.sh` / `setup.ps1` build `.venv-nemotron`; `download_models.py` fetches the experts | |
+

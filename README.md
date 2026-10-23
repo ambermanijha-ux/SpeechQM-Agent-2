@@ -165,14 +165,14 @@ audio_qc/
 | Detected_Language, LID_Confidence | IndicLID language of the ASR transcript | not the folder's language |
 | Audio_Language, Audio_LID_Confidence, Audio_Language_OK | language heard in the audio itself (Whisper-large-v3 and MMS-LID-126); Hindi and Urdu count as the same spoken language | `False`: audio in another language |
 | Script_Share, Script_OK | share of letters in the language's script | `False` |
-| ASR_Transcript_Quality | `passed`, or `failed:` with the reason (almost empty, looping, or far too little text for the speech: the ASR model dropped speech) | `failed` |
-| ASR_Disagreement | word difference between the main ASR and a second ASR model; needs no reference, and tracks WER (Spearman 0.61 here) | > 1 |
+| ASR_Transcript_Quality | `passed`, or `failed:` with the reason (almost empty, looping, far too little text for the speech: the ASR model dropped speech, or the ASR experts disagree: see MoE) | `failed` |
+| ASR_Experts, MoE_WER, MoE_CER, Main_Agreement_CER, Least_Agreeing_ASR | MoE score (the paper's "WER/CER across several ASR models"; needs no reference): how many ASR models transcribed the file (main ASR + experts), their mean word / character difference over all pairs, the character difference between the main transcript and the closest expert (task 3 fails the transcript above `MOE_MAX_CER`, 0.5), and the model furthest from the others | high; `Least_Agreeing_ASR` = `main` |
 | CTC_Score, CTC_Status, CTC_Scored_Text | how well the transcript aligns with the audio, 0-1; Good > 0.7, Medium > 0.5; the file's reference if it has one, else the ASR transcript | `Poor` |
 | ASR_Alignment_Score | forced-alignment score of the ASR transcript (task 14) | |
 | LLM_Score, LLM_Comment | 0-10 coherence/fluency of the whole ASR transcript, judged by an LLM (as in the paper) | low |
 | LLM_Chunk_Score, Low_Score_Chunk_Share, Empty_ASR_Chunk_Share | the judge's mean 0-10 score over up to 30 short ASR chunks, the share it scores 4 or less, and the share of speech chunks the ASR left empty. Separates good from bad transcripts much better than LLM_Score | low score, high shares |
 | Domain, Domain_From | topic (Healthcare, Insurance, Finance, Sales, Daily Life, ...), judged from the reference where there is one, else the ASR transcript | unexpected topic |
-| WER, CER, WER_Second_ASR | error rates of the ASR vs the reference, and of the second ASR model | |
+| WER, CER, WER_Bodhan, WER_Nemotron, WER_wav2vec2 | error rates of the main ASR vs the reference, and the WER of each ASR expert (per-expert CER in `wer.csv`) | |
 | Segment_WER, Segment_WER_No_Cross_Talk, Bad_Segment_Share | WER with every reference utterance transcribed on its own (from the time-stamps), without utterances that overlap another speaker, and the share of utterances with WER > 0.8 | |
 | Near_Duplicate_Utterances, Repeated_Utterances_In_File, Shares_Audio_With, Public_Corpus_Matches | utterances (nearly) the same as one in another file / the same file, files sharing audio with this one (also re-encoded or cut copies), matches in the public-corpus index | any |
 | English_Words_in_Reference | Latin-script words in the reference transcript | |
@@ -198,7 +198,9 @@ real WER (Spearman -0.58 on 11 reference files) and is the one to use for rankin
 | Speakers | `pyannote/speaker-diarization-3.1` | Silero VAD + SpeechBrain ECAPA clustering |
 | ASR, 14 Indian languages | `ai4bharat/indic-conformer-600m-multilingual` (RNNT; a chunk RNNT leaves empty gets the CTC decoder's text) | the wav2vec2 model of the language |
 | ASR, English | `openai/whisper-large-v3` | |
-| Second ASR opinion, CTC score, forced alignment | wav2vec2: `ai4bharat/indicwav2vec-hindi` (Hindi), ai4bharat Bengali/Gujarati/Odia, else Vakyansh (`Harveenchadha/vakyansh-wav2vec2-<language>-...`); CTC on Hindi uses Vakyansh Hindi | Vakyansh model of the language |
+| ASR experts (MoE score), Indian languages | `bodhan-ai/indic-transcribe-flex` (Canary 1.2B; gated: accept its terms) and the wav2vec2 model below | the wav2vec2 model only |
+| ASR experts (MoE score), English | `nvidia/nemotron-speech-streaming-en-0.6b` (runs in `.venv-nemotron`, see 9), `bodhan-ai/indic-transcribe-flex` (Indian-accented English) and the wav2vec2 model below | |
+| CTC score, forced alignment, ASR expert | wav2vec2: `ai4bharat/indicwav2vec-hindi` (Hindi), ai4bharat Bengali/Gujarati/Odia, else Vakyansh (`Harveenchadha/vakyansh-wav2vec2-<language>-...`); CTC on Hindi uses Vakyansh Hindi | Vakyansh model of the language |
 | Language identification, text | AI4Bharat IndicLID (FastText + IndicBERT) | same |
 | Language identification, audio | `openai/whisper-large-v3` and `facebook/mms-lid-126`, the more confident wins | same (not gated) |
 | Transliteration | two LLM runs that must agree, checked against AI4Bharat IndicXlit when available (see below) | words stay in Roman script |
@@ -246,6 +248,10 @@ our Odia file as Odia).
 - **Speakers across batches:** every run adds its speakers' voice embeddings to `speaker_db/` (`SPEAKER_DB=<folder>`
   to use another, `SPEAKER_DB=none` to turn it off). Re-running the same files replaces their entries, so a re-run
   does not mark its own speakers as `Old`.
+- **MoE experts:** every file is also transcribed by the ASR experts (`MOE_EXPERTS=bodhan,nemotron,wav2vec2`; `none`
+  for the main ASR only); their transcripts are in `results/asr_experts.csv`, the scores in `results/asr_moe.csv`.
+  `MOE_MAX_CER` (0.5) is where task 3 fails a transcript. Nemotron needs transformers >= 5.13, so setup gives it its
+  own venv, `.venv-nemotron` (`requirements-nemotron.txt`); without it the English MoE score uses the other experts.
 - **Re-planning:** after the checks, steps that failed or that the monitor wanted re-run go back to the planner, which
   picks those worth one more run (`REPLAN=0` turns this off).
 - **Tool library:** every script the code-writing LLM wrote that passed its checks is kept in `tool_library/`. The

@@ -175,7 +175,9 @@ def run_info(hf_user, backend, device):
             "judge_model": ollama_model(config.JUDGE_MODEL), "monitor_model": ollama_model(config.MONITOR_MODEL),
             "hf_user": hf_user, "speech_backend": backend, "indicxlit": xlit_backend(),
             "audio_lid_models": list(config.AUDIO_LID_MODELS), "speaker_db": config.SPEAKER_DB,
-            "public_corpus_index": public_index_info(), "replan": config.REPLAN, "languages": {}}
+            "public_corpus_index": public_index_info(), "replan": config.REPLAN,
+            "moe_experts": {"experts": config.MOE_EXPERTS, "bodhan": config.BODHAN_ASR, "nemotron": config.NEMOTRON_ASR,
+                            "max_cer": config.MOE_MAX_CER}, "languages": {}}
 
 
 def public_index_info():

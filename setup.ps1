@@ -15,6 +15,10 @@ if ($LASTEXITCODE -ne 0) { exit 1 }
 # auto: the CUDA build of torch on machines with an NVIDIA GPU, CPU build otherwise
 uv pip install --python .venv\Scripts\python.exe --torch-backend=auto -r requirements.txt
 if ($LASTEXITCODE -ne 0) { exit 1 }
+Write-Host "Creating .venv-nemotron for the Nemotron ASR expert (needs a newer transformers) ..."
+uv venv -p 3.11 --allow-existing .venv-nemotron
+uv pip install --python .venv-nemotron\Scripts\python.exe --torch-backend=auto -r requirements-nemotron.txt
+if ($LASTEXITCODE -ne 0) { exit 1 }
 
 if (-not (Get-Command ollama -ErrorAction SilentlyContinue) -and
     -not (Test-Path "$env:LOCALAPPDATA\Programs\Ollama\ollama.exe")) {

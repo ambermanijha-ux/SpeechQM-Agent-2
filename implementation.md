@@ -106,9 +106,9 @@ Implementation types: **model** = fixed code around a speech/text model; **code*
 
 | # | Check | Output (`results/`) | Type | Notes |
 |---|---|---|---|---|
-| 1 | ASR transcription | `indicconf_hypothesis.csv`, `asr_second_opinion.csv`, `asr_chunks.csv` | model | IndicConformer-600M RNNT (CTC for chunks RNNT leaves empty) for 14 Indic languages, Whisper-large-v3 for English; wav2vec2 as second opinion (`ASR_Disagreement`) (6.2) |
+| 1 | ASR transcription | `indicconf_hypothesis.csv`, `asr_experts.csv`, `asr_moe.csv`, `asr_chunks.csv` | model | IndicConformer-600M RNNT (CTC for chunks RNNT leaves empty) for 14 Indic languages, Whisper-large-v3 for English; ASR experts for the MoE score: Bodhan Indic-Transcribe-Flex (Indic and English), NVIDIA Nemotron (English), and wav2vec2 (6.2) |
 | 2 | Speakers and durations | `num_speakers.csv` | model | pyannote or local diarization, global speaker IDs across files and batches (`speaker_db/`), speech and overlap seconds (6.3) |
-| 3 | Transcript quality | `transcript_quality.csv` | code | fails: ≤ 3 words, > 20 % repeated 4-word phrases (loops), or < 5 letters per second of speech (ASR dropped speech) |
+| 3 | Transcript quality | `transcript_quality.csv` | code | fails: ≤ 3 words, > 20 % repeated 4-word phrases (loops), < 5 letters per second of speech (ASR dropped speech), or MoE: even the closest ASR expert differs from the main transcript on > 50 % of the characters (`MOE_MAX_CER`); adds `MoE_WER`, `MoE_CER`, `Main_Agreement_CER` |
 | 4 | Characters (graphemes) | `character_list.csv` | agent | |
 | 5 | Vocabulary | `vocab_list.csv` | code | unique words, tags removed |
 | 6 | Script / language verification | `language_verification.csv` | code | share of letters in the language's Unicode block (`config.SCRIPTS`); OK = 100 % |
@@ -129,7 +129,7 @@ Implementation types: **model** = fixed code around a speech/text model; **code*
 | 21 | Sample rate | `sample_rate_check.csv` | agent | `Sample_Rate` and `Channels` as stored, reported only |
 | 22 | Speaker durations (dataset) | `speaker_durations.csv` | code | total hours per global speaker |
 | 23 | Duplicates | `duplicate_utterances.csv`, `near_duplicates.csv`, `duplicates_per_file.csv` | code | identical normalized references; near-duplicate utterances (TF-IDF character 3-grams ≥ 0.9); shared audio (landmark fingerprints); matches in the public-corpus index |
-| 24 | WER | `wer.csv`, `segment_wer.csv` | code | `jiwer` WER and CER per file paired by filename, punctuation and tags removed; second ASR's WER; every reference utterance transcribed on its own (with/without cross-talk) |
+| 24 | WER | `wer.csv`, `segment_wer.csv` | code | `jiwer` WER and CER per file paired by filename, punctuation and tags removed; each ASR expert's WER and CER; every reference utterance transcribed on its own (with/without cross-talk) |
 | 25 | Timestamp segmentation | `segments.csv`, `segmentation_summary.csv`, `segments/*.wav` | code | utterances cut at the reference time-stamps and aligned; timing issues vs notes |
 | 26 | Code-mixing | `code_mixing.csv`, `code_mixing_summary.csv` | code | script per word, Code-Mixing Index (Das & Gambäck 2014), other scripts |
 

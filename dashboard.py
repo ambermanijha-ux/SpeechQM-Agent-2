@@ -34,8 +34,8 @@ def flags(r) -> list:
         out.append(("bad", f"transcript {q}"))
     if (w := _num(get("WER"))) is not None and w > 0.8:
         out.append(("bad", f"WER {w:.2f}"))
-    if (d := _num(get("ASR_Disagreement"))) is not None and d > 1.0:
-        out.append(("warn", f"ASR models disagree ({d:.2f})"))
+    if (d := _num(get("MoE_CER"))) is not None and d > 0.5 and not (q and str(q).startswith("failed")):
+        out.append(("warn", f"ASR experts differ on {d:.0%} of the characters"))
     if (s := _num(get("Low_Score_Chunk_Share"))) is not None and s > 0.3:
         out.append(("warn", f"judge: {s:.0%} of chunks look garbled"))
     if get("Shares_Audio_With"):

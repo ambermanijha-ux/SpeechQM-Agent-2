@@ -1,0 +1,7 @@
+# The NVIDIA Nemotron ASR expert (MoE score, task 3) needs transformers >= 5.13, which the main .venv cannot take
+# (pyannote and the other models run on 4.57): setup puts it in its own venv, .venv-nemotron, run by nemotron_worker.py
+torch==2.11.0
+transformers>=5.13
+librosa
+soundfile
+numpy

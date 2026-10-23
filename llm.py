@@ -34,11 +34,12 @@ from utility_functions import (
     audio_language,
     transcribe_pieces,
     main_asr_for,
+    words,
 )
 import librosa
 import pandas as pd
 from config import (OLLAMA_BASE_URL, PLANNER_MODEL, CODER_MODEL, JUDGE_MODEL, MONITOR_MODEL, CODER_MAX_TOKENS, LLM_NUM_CTX, LANG_CODES,
-                    DEFAULT_LANGUAGE, SCRIPTS, TOOL_LIBRARY, REPLAN, PUBLIC_INDEX)
+                    DEFAULT_LANGUAGE, SCRIPTS, TOOL_LIBRARY, REPLAN, PUBLIC_INDEX, MOE_MAX_CER)
 import soundfile as sf
 import unicodedata
 from collections import Counter
@@ -532,16 +533,6 @@ def parse_prompt(prompt: str) -> Dict[str, Optional[str]]:
         logging.error(f"Invalid ground truth CSV: {result['ground_truth_csv']}")
         result["ground_truth_csv"] = None
     return result
-
-def words(text: str) -> list:
-    """Words of a transcript without [tags]/<tags> and punctuation; keeps Indic vowel signs (unicode category M)
-    and apostrophes/hyphens inside a word (don't, check-up)."""
-    import unicodedata
-    t = re.sub(r"\[[^\]]*\]|<[^>]*>", " ", str(text))
-    inword = lambda ch: unicodedata.category(ch)[0] in "LMN"
-    return "".join(ch if inword(ch) or (ch in "'’-" and 0 < i < len(t) - 1 and inword(t[i - 1]) and inword(t[i + 1]))
-                   else " " if unicodedata.category(ch)[0] in "PSZ" or unicodedata.category(ch) == "Cc" else ch
-                   for i, ch in enumerate(t)).split()
 
 def language_of(state) -> str:
     """Language named in the prompt (via its code), else DEFAULT_LANGUAGE."""
@@ -1145,6 +1136,15 @@ def transcript_quality_agent(state: CombinedStateDict) -> CombinedStateDict:
         speech = {f: d - float(silence.get(f, 0)) for f, d in audio.items()}
         df['Speech_s'] = df[fcol].map(speech).round(1)
         df['Quality_Check'] = [transcript_quality(t, speech.get(f)) for f, t in zip(df[fcol], df[col].fillna("").astype(str))]
+        # MoE score (paper: WER/CER across several ASR models): the ASR experts' transcripts against the main one
+        moe_path = os.path.join(os.path.dirname(csv_path), "asr_moe.csv")
+        if col.lower() == "indiconformer_hypothesis" and os.path.isfile(moe_path):
+            moe = pd.read_csv(moe_path).drop(columns=["Main_ASR_Model"], errors="ignore")
+            df = df.merge(moe, left_on=fcol, right_on="Filename", how="left", suffixes=("", "_moe"))
+            df = df.drop(columns=[c for c in df.columns if c.endswith("_moe")])
+            disagree = (df["Quality_Check"] == "passed") & (pd.to_numeric(df["Main_Agreement_CER"], errors="coerce") > MOE_MAX_CER)
+            df.loc[disagree, "Quality_Check"] = df.loc[disagree, "Main_Agreement_CER"].map(
+                lambda c: f"failed: ASR experts disagree (closest expert differs on {c:.0%} of the characters)")
         output_path = os.path.join(os.path.dirname(csv_path), "transcript_quality.csv")
         df.to_csv(output_path, index=False)
         return {"transcript_quality_output": f"CSV saved at: {output_path}"}
@@ -1754,11 +1754,12 @@ def wer_computation_agent(state: CombinedStateDict) -> CombinedStateDict:
         # pair by filename (only some files may have a reference); compare words without punctuation/tags
         refs = dict(zip(ref_df[next(c for c in ref_df.columns if c.lower() == "filename")].astype(str),
                         ref_df["normalized_transcripts"].fillna("").astype(str)))
-        second_path = os.path.join(parent, 'results', "asr_second_opinion.csv")   # the wav2vec2 ASR, when it is not the main one
-        second = {}
-        if os.path.exists(second_path):
-            d = pd.read_csv(second_path)
-            second = dict(zip(d["Filename"].astype(str), d["Second_Hypothesis"].fillna("").astype(str)))
+        experts_path = os.path.join(parent, 'results', "asr_experts.csv")   # the MoE ASR experts (task 1)
+        experts = {}
+        if os.path.exists(experts_path):
+            d = pd.read_csv(experts_path)
+            for f, e, t in zip(d["Filename"].astype(str), d["Expert"], d["Hypothesis"].fillna("").astype(str)):
+                experts.setdefault(f, {})[e] = t
         wer_rows = []
         for fname, hyp in zip(hyp_df["Filename"].astype(str), hyp_df["Indiconformer_Hypothesis"].fillna("").astype(str)):
             if fname not in refs:
@@ -1768,10 +1769,11 @@ def wer_computation_agent(state: CombinedStateDict) -> CombinedStateDict:
             try:
                 row["WER"] = round(jiwer.wer(ref, hyp), 4) if ref else "No reference"
                 row["CER"] = round(jiwer.cer(ref.replace(" ", ""), hyp.replace(" ", "")), 4) if ref else None
-                if fname in second and ref:   # paper's "WER/CER from multiple ASR models"
-                    other = " ".join(words(second[fname]))
-                    row["Second_ASR_WER"] = round(jiwer.wer(ref, other), 4)
-                    row["Second_ASR_CER"] = round(jiwer.cer(ref.replace(" ", ""), other.replace(" ", "")), 4)
+                for expert, text in experts.get(fname, {}).items():   # paper's "WER/CER from multiple ASR models"
+                    if ref:
+                        other = " ".join(words(text))
+                        row[f"WER_{expert}"] = round(jiwer.wer(ref, other), 4)
+                        row[f"CER_{expert}"] = round(jiwer.cer(ref.replace(" ", ""), other.replace(" ", "")), 4)
             except Exception as e:
                 row["WER"] = "Error"
                 logging.warning(f"WER computation failed for {fname}: {e}")
@@ -2241,7 +2243,7 @@ def main(user_prompt: str, audio_dir: Optional[str] = None, lang_code: Optional[
 
 
 # steps that skip their work when their output file exists
-REUSED_OUTPUTS = {1: ["indicconf_hypothesis.csv", "asr_second_opinion.csv", "asr_chunks.csv"], 2: ["num_speakers.csv"],
+REUSED_OUTPUTS = {1: ["indicconf_hypothesis.csv", "asr_experts.csv", "asr_moe.csv", "asr_chunks.csv"], 2: ["num_speakers.csv"],
                   8: ["vad_silence_stats.csv"], 15: ["indiclid_language_identification.csv"], 16: ["normalized_list.csv"]}
 
 

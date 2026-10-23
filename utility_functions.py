@@ -19,7 +19,8 @@ from config import (ASR_MODELS, ALIGN_MODEL, ASR_ENGINE, INDICCONFORMER, INDICCO
                     INDICCONFORMER_LANGS, ENGLISH_ASR, ASR_GPU_MEM_GB, DEFAULT_LANGUAGE, SPEAKER_MODEL, INDICBERT_TOKENIZER, INDICLID_DIR, MODELS_DIR,
                     SPEECH_BACKEND, HF_TOKEN, PYANNOTE_VAD_MODEL, PYANNOTE_DIARIZATION,
                     DIAR_WINDOW_S, DIAR_HOP_S, DIAR_CLUSTER_THRESHOLD, SPEAKER_MATCH_THRESHOLD, LANG_CODES,
-                    AUDIO_LID_MODELS, SPEAKER_DB, torch_device)
+                    AUDIO_LID_MODELS, SPEAKER_DB, MOE_EXPERTS, BODHAN_ASR, BODHAN_DIR, NEMOTRON_ASR, NEMOTRON_PYTHON,
+                    EXPERT_CHUNK_S, torch_device)
 
 SR = 16000
 DEVICE = torch_device()
@@ -239,14 +240,14 @@ def get_asr(model_id):
         return processor, model
 
 
-def asr_chunks(audio):
-    """Merge VAD speech regions into chunks of at most ASR_CHUNK_S seconds."""
+def asr_chunks(audio, max_s=ASR_CHUNK_S, regions=None):
+    """Merge VAD speech regions into chunks of at most max_s seconds."""
     chunks = []
-    for s, e in speech_regions(audio):
-        while e - s > ASR_CHUNK_S:
-            chunks.append((s, s + ASR_CHUNK_S))
-            s += ASR_CHUNK_S
-        if chunks and e - chunks[-1][0] <= ASR_CHUNK_S and s - chunks[-1][1] < 1.0:
+    for s, e in (speech_regions(audio) if regions is None else regions):
+        while e - s > max_s:
+            chunks.append((s, s + max_s))
+            s += max_s
+        if chunks and e - chunks[-1][0] <= max_s and s - chunks[-1][1] < 1.0:
             chunks[-1] = (chunks[-1][0], e)
         else:
             chunks.append((s, e))
@@ -285,6 +286,42 @@ def get_whisper():
                         torch_dtype=torch.float16 if DEVICE == "cuda" else torch.float32)
 
 
+@lru_cache(maxsize=1)
+def get_bodhan():
+    """Bodhan Indic-Transcribe-Flex (Canary 1.2B). Its code ships with the weights; it is imported as the package
+    bodhan_flex so its generic module names (lid, inference) cannot clash with others."""
+    import importlib
+    import sys
+    import types
+    from huggingface_hub import snapshot_download
+    with MODEL_LOCK:
+        snapshot_download(BODHAN_ASR, local_dir=str(BODHAN_DIR), ignore_patterns=["nemo/*", "*.png"])   # nemo/: same weights
+        pkg = types.ModuleType("bodhan_flex")
+        pkg.__path__ = [str(BODHAN_DIR)]
+        sys.modules.setdefault("bodhan_flex", pkg)
+        it = importlib.import_module("bodhan_flex.indic_transcribe")
+        long_form = importlib.import_module("bodhan_flex.long_form")
+        return it.IndicTranscribe.from_pretrained(str(BODHAN_DIR), device=DEVICE), long_form.transcribe_long
+
+
+@lru_cache(maxsize=1)
+def get_nemotron():
+    """nemotron_worker.py running in NEMOTRON_PYTHON's venv (Nemotron needs transformers >= 5.13), kept for the run."""
+    import atexit
+    import subprocess
+    if not os.path.isfile(NEMOTRON_PYTHON):
+        raise RuntimeError(f"{NEMOTRON_PYTHON} not found: set up the Nemotron venv (README, 'MoE experts')")
+    proc = subprocess.Popen([NEMOTRON_PYTHON, os.path.join(os.path.dirname(os.path.abspath(__file__)), "nemotron_worker.py"),
+                             NEMOTRON_ASR], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
+    atexit.register(proc.kill)
+    for line in proc.stdout:
+        if line.startswith("{"):
+            ready = json.loads(line)
+            if "ready" in ready:
+                return proc
+    raise RuntimeError("Nemotron worker exited before loading the model")
+
+
 def main_asr_for(language):
     """(engine, model name for the reports) of the main ASR of a language."""
     if ASR_ENGINE == "best" and language in INDICCONFORMER_LANGS:
@@ -292,6 +329,19 @@ def main_asr_for(language):
     if ASR_ENGINE == "best" and language == "English":
         return "whisper", ENGLISH_ASR
     return "wav2vec", asr_model_for(language)
+
+
+def experts_for(language):
+    """[(expert, model name)] of the ASR experts that transcribe a file next to the main ASR (MoE score, task 3)."""
+    main = main_asr_for(language)[0]
+    out = []
+    if "bodhan" in MOE_EXPERTS and (language in INDICCONFORMER_LANGS or language == "English"):
+        out.append(("bodhan", BODHAN_ASR))
+    if "nemotron" in MOE_EXPERTS and language == "English":
+        out.append(("nemotron", NEMOTRON_ASR))
+    if "wav2vec2" in MOE_EXPERTS and main != "wav2vec":
+        out.append(("wav2vec2", asr_model_for(language)))
+    return out
 
 
 def asr_model_for(language):
@@ -314,9 +364,30 @@ def align_model_for(language):
 
 
 def transcribe_pieces(pieces, source_lang, engine):
-    """Text of each speech chunk with one ASR engine: indicconformer, whisper or wav2vec. IndicConformer's RNNT decoder
-    returns nothing on some chunks (23 of 41 in the Gujarati file): those chunks get its CTC decoder's text, which
-    lowered the pooled WER of the 10 Indic reference files from 0.654 to 0.635 and was never worse by more than 0.003."""
+    """Text of each speech chunk with one ASR engine: indicconformer, whisper, wav2vec, or the experts bodhan and
+    nemotron. IndicConformer's RNNT decoder returns nothing on some chunks (23 of 41 in the Gujarati file): those chunks
+    get its CTC decoder's text, which lowered the pooled WER of the 10 Indic reference files from 0.654 to 0.635 and
+    was never worse by more than 0.003."""
+    if engine == "bodhan":
+        asr, transcribe_long = get_bodhan()
+        code = "en" if source_lang == "English" else INDICCONFORMER_LANGS[source_lang]
+        with MODEL_LOCK:   # transcribe_long cuts > 30 s at pauses and re-decodes a chunk that loops
+            return [" ".join(transcribe_long(asr, p, code, mode="native").split()) if len(p) >= SR // 10 else ""
+                    for p in pieces]
+    if engine == "nemotron":
+        import tempfile
+        proc = get_nemotron()
+        with tempfile.TemporaryDirectory() as tmp, MODEL_LOCK:
+            path = os.path.join(tmp, "pieces.npz")
+            np.savez(path, **{f"piece_{i}": p.astype(np.float32) for i, p in enumerate(pieces)})
+            proc.stdin.write(path + "\n")
+            proc.stdin.flush()
+            reply = json.loads(next((line for line in proc.stdout if line.startswith("{")), '{"error": "worker exited"}'))
+        if "error" in reply:
+            raise RuntimeError(f"Nemotron worker: {reply['error']}")
+        return reply["texts"]
+    if engine == "wav2vec2":
+        engine = "wav2vec"
     if engine == "whisper":
         with MODEL_LOCK:
             out = get_whisper()([{"raw": p, "sampling_rate": SR} for p in pieces], batch_size=16,
@@ -345,26 +416,77 @@ def transcribe_pieces(pieces, source_lang, engine):
     return texts
 
 
-def transcribe_audio(audio_path, source_lang, second_opinion=False, chunks=False):
-    """Main ASR text of a file. second_opinion: also (wav2vec2 text, wav2vec2 model) when the main ASR is not wav2vec2;
-    chunks: also [(start s, end s, text)] per chunk. Every engine gets the same chunks: VAD speech regions merged into
-    <= ASR_CHUNK_S seconds."""
+def transcribe_audio(audio_path, source_lang, experts=False, chunks=False):
+    """Main ASR text of a file. experts: also [(expert, model, text)] from the ASR experts of experts_for();
+    chunks: also [(start s, end s, text)] per chunk. All models hear the same VAD speech regions: merged into
+    <= ASR_CHUNK_S seconds for the main ASR and wav2vec2, <= EXPERT_CHUNK_S for Bodhan and Nemotron."""
     engine, name = main_asr_for(source_lang)
     print(f"Transcribing {audio_path} using {name} on {DEVICE}")
     audio_array = load_audio(audio_path)
-    spans = [(s, e) for s, e in asr_chunks(audio_array) if (e - s) * SR >= SR // 10]
+    regions = speech_regions(audio_array)
+    cut = lambda max_s: [(s, e) for s, e in asr_chunks(audio_array, max_s, regions) if (e - s) * SR >= SR // 10]
+    spans = cut(ASR_CHUNK_S)
     pieces = [audio_array[int(s * SR):int(e * SR)] for s, e in spans]
     texts = transcribe_pieces(pieces, source_lang, engine)
     text = " ".join(t for t in texts if t)
-    if not second_opinion and not chunks:
+    if not experts and not chunks:
         return text
     out = [text]
-    if second_opinion:
-        out.append((" ".join(t for t in transcribe_pieces(pieces, source_lang, "wav2vec") if t), asr_model_for(source_lang))
-                   if engine != "wav2vec" else None)
+    if experts:
+        long_pieces = [audio_array[int(s * SR):int(e * SR)] for s, e in cut(EXPERT_CHUNK_S)]
+        got = []
+        for expert, model in experts_for(source_lang):
+            try:   # an expert that cannot run leaves the MoE score with fewer models, not the file untranscribed
+                got.append((expert, model, " ".join(t for t in transcribe_pieces(
+                    long_pieces if expert in ("bodhan", "nemotron") else pieces, source_lang, expert) if t)))
+            except Exception as e:
+                logging.warning(f"ASR expert {expert} failed on {audio_path}: {type(e).__name__}: {e}")
+        out.append(got)
     if chunks:
         out.append([(round(s, 2), round(e, 2), t) for (s, e), t in zip(spans, texts)])
     return tuple(out)
+
+
+def words(text: str) -> list:
+    """Words of a transcript without [tags]/<tags> and punctuation; keeps Indic vowel signs (unicode category M)
+    and apostrophes/hyphens inside a word (don't, check-up)."""
+    import unicodedata
+    t = re.sub(r"\[[^\]]*\]|<[^>]*>", " ", str(text))
+    inword = lambda ch: unicodedata.category(ch)[0] in "LMN"
+    return "".join(ch if inword(ch) or (ch in "'’-" and 0 < i < len(t) - 1 and inword(t[i - 1]) and inword(t[i + 1]))
+                   else " " if unicodedata.category(ch)[0] in "PSZ" or unicodedata.category(ch) == "Cc" else ch
+                   for i, ch in enumerate(t)).split()
+
+
+def moe_score(texts: dict) -> dict:
+    """The MoE score of one file from {model: transcript}, the main ASR first. Compared lower-cased, without
+    punctuation, both ways round (WER/CER are not symmetric), each capped at 1 so the score is the share that differs
+    (a model that dropped most of the speech gave 3.6 against the longer transcripts in kn001): an empty against a
+    non-empty transcript counts as 1.
+      MoE_WER, MoE_CER: mean difference over all pairs of models;
+      Main_Agreement_CER: CER between the main transcript and the closest expert (task 3 fails it above MOE_MAX_CER);
+      Least_Agreeing: with 3+ models, the one furthest from the others."""
+    import jiwer
+    norm = {k: " ".join(words(v.lower())) for k, v in texts.items()}
+
+    def diff(a, b, char):
+        x, y = (norm[a].replace(" ", ""), norm[b].replace(" ", "")) if char else (norm[a], norm[b])
+        if not x or not y:
+            return 0.0 if x == y else 1.0
+        f = jiwer.cer if char else jiwer.wer
+        return (min(f(x, y), 1.0) + min(f(y, x), 1.0)) / 2
+
+    names = list(norm)
+    pairs = [(a, b) for i, a in enumerate(names) for b in names[i + 1:]]
+    if not pairs:
+        return {}
+    cer = {p: diff(*p, True) for p in pairs}
+    out = {"Experts": len(names), "MoE_WER": round(float(np.mean([diff(*p, False) for p in pairs])), 4),
+           "MoE_CER": round(float(np.mean(list(cer.values()))), 4),
+           "Main_Agreement_CER": round(min(c for (a, b), c in cer.items() if a == names[0]), 4)}
+    if len(names) >= 3:
+        out["Least_Agreeing"] = max(names, key=lambda n: np.mean([c for p, c in cer.items() if n in p]))
+    return out
 
 
 def transcribe_folder_to_csv(folder_path: str, source_language: str):
@@ -376,7 +498,8 @@ def transcribe_folder_to_csv(folder_path: str, source_language: str):
         logging.info(f"Skipping transcription: File already exists at {output_path}")
         return output_path
 
-    results, second, chunk_rows = [], [], []
+    results, expert_rows, moe_rows, chunk_rows = [], [], [], []
+    main_model = main_asr_for(source_language)[1]
     for filename in sorted(os.listdir(folder_path)):
         audio_path = os.path.join(folder_path, filename)
         file_size = os.path.getsize(audio_path)
@@ -390,19 +513,18 @@ def transcribe_folder_to_csv(folder_path: str, source_language: str):
         transcribe_filename = filename
 
         try:
-            hypothesis, other, pieces = transcribe_audio(audio_path, source_language, second_opinion=True, chunks=True)
+            hypothesis, experts, pieces = transcribe_audio(audio_path, source_language, experts=True, chunks=True)
             chunk_rows += [{"Filename": transcribe_filename, "Chunk": i, "Start_s": s, "End_s": e, "Text": t}
                            for i, (s, e, t) in enumerate(pieces)]
             results.append({
                 "Filename": transcribe_filename,
                 "Indiconformer_Hypothesis": hypothesis
             })
-            if other:   # how much a second ASR disagrees: a quality signal that needs no reference
-                import jiwer
-                a, b = " ".join(hypothesis.split()), " ".join(other[0].split())
-                second.append({"Filename": transcribe_filename, "Main_ASR_Model": main_asr_for(source_language)[1],
-                               "Second_ASR_Model": other[1], "Second_Hypothesis": other[0],
-                               "ASR_Disagreement": round(jiwer.wer(a, b), 4) if a and b else None})
+            # MoE score: how far the experts' transcripts are from the main one, a quality signal that needs no reference
+            expert_rows += [{"Filename": transcribe_filename, "Expert": e, "Model": m, "Hypothesis": t} for e, m, t in experts]
+            if experts:
+                moe_rows.append({"Filename": transcribe_filename, "Main_ASR_Model": main_model,
+                                 **moe_score({"main": hypothesis, **{e: t for e, _, t in experts}})})
             logging.info(f"Transcribed {transcribe_filename}: {hypothesis[:50]}...")
         except Exception as e:
             logging.error(f"Failed to transcribe {transcribe_filename}: {e}")
@@ -413,8 +535,9 @@ def transcribe_folder_to_csv(folder_path: str, source_language: str):
 
     df = pd.DataFrame(results)
     df.to_csv(output_path, index=False)
-    if second:
-        pd.DataFrame(second).to_csv(os.path.join(os.path.dirname(output_path), "asr_second_opinion.csv"), index=False)
+    if expert_rows:
+        pd.DataFrame(expert_rows).to_csv(os.path.join(os.path.dirname(output_path), "asr_experts.csv"), index=False)
+        pd.DataFrame(moe_rows).to_csv(os.path.join(os.path.dirname(output_path), "asr_moe.csv"), index=False)
     # per chunk: the LLM judge (task 17) rates chunks, and segment-level checks can find where a file goes wrong
     pd.DataFrame(chunk_rows).to_csv(os.path.join(os.path.dirname(output_path), "asr_chunks.csv"), index=False)
     logging.info(f"Transcriptions saved to {output_path}")
