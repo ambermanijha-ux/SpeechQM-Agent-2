@@ -729,7 +729,9 @@ task prompts in `llm.py`, but run the tool on data you are allowed to process, a
 - `get_nemotron()`: starts `nemotron_worker.py` in `.venv-nemotron` (Nemotron needs transformers >= 5.13; the main
   venv has 4.57) and keeps it for the run; pieces go to it as an `.npz` file, texts come back as JSON.
 - `experts_for(language)`: the ASR experts of a language (`MOE_EXPERTS`): every model covering the language other than
-  the main ASR: Bodhan, IndicConformer (Indic), Whisper and Nemotron (English), and
+  the main ASR: Bodhan, IndicConformer-600M and the language's IndicConformer-large (`ic_large`, `get_ic_large()`:
+  ai4bharat's per-language hybrid model as an ONNX export, CTC decoder, run by `onnx-asr`) for Indic, Whisper and
+  Nemotron for English, and
   the wav2vec2 model when it is not the main ASR.
 - `asr_chunks(audio, max_s, regions)`: speech regions merged into pieces of at most `max_s` seconds (25 s for Bodhan
   and Nemotron, which do better on longer pieces, 8 s for the others; `asr_chunks.csv` has the main ASR's pieces). All models hear the same

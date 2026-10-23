@@ -89,11 +89,15 @@ ENGLISH_ASR = os.environ.get("ENGLISH_ASR", "openai/whisper-large-v3")
 ASR_GPU_MEM_GB = float(os.environ.get("ASR_GPU_MEM_GB", "12"))   # ONNX Runtime arena cap (GPUs shared with Ollama)
 # MoE score (task 3; the paper's "WER/CER across several ASR models"): next to the main ASR, these ASR "experts"
 # transcribe every file, and how far the main transcript is from the experts scores it without a reference.
-# Every model of the language that is not the main ASR: Indic: Bodhan Indic-Transcribe-Flex, IndicConformer, wav2vec2;
-# English: Bodhan (Indian-accented English), Whisper, NVIDIA Nemotron, wav2vec2.
-# MOE_EXPERTS picks from bodhan, indicconformer, whisper, nemotron, wav2vec2 ("none": main ASR only).
-MOE_EXPERTS = [e.strip() for e in os.environ.get("MOE_EXPERTS", "bodhan,indicconformer,whisper,nemotron,wav2vec2").split(",")
-               if e.strip() and e.strip() != "none"]
+# Every model of the language that is not the main ASR: Indic: Bodhan Indic-Transcribe-Flex, IndicConformer-600M
+# multilingual, the language's own IndicConformer-large (ic_large), wav2vec2; English: Bodhan (Indian-accented
+# English), Whisper, NVIDIA Nemotron, wav2vec2.
+# MOE_EXPERTS picks from bodhan, indicconformer, ic_large, whisper, nemotron, wav2vec2 ("none": main ASR only).
+MOE_EXPERTS = [e.strip() for e in os.environ.get("MOE_EXPERTS", "bodhan,indicconformer,ic_large,whisper,nemotron,wav2vec2")
+               .split(",") if e.strip() and e.strip() != "none"]
+# ai4bharat's per-language IndicConformer-large (hybrid CTC-RNNT, 120M; ai4bharat/indicconformer_stt_<code>_hybrid_
+# ctc_rnnt_large) needs AI4Bharat's NeMo fork; OpenVoiceOS's ONNX exports (CTC decoder) run with onnx-asr instead
+IC_LARGE_ONNX = "OpenVoiceOS/ai4bharat-indicconformer-{code}-onnx"
 BODHAN_ASR = "bodhan-ai/indic-transcribe-flex"   # gated: accept its terms on Hugging Face
 BODHAN_DIR = MODELS_DIR / "indic-transcribe-flex"
 NEMOTRON_ASR = os.environ.get("NEMOTRON_ASR", "nvidia/nemotron-speech-streaming-en-0.6b")

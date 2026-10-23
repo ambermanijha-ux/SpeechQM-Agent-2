@@ -20,7 +20,7 @@ from config import (ASR_MODELS, ALIGN_MODEL, ASR_ENGINE, INDICCONFORMER, INDICCO
                     SPEECH_BACKEND, HF_TOKEN, PYANNOTE_VAD_MODEL, PYANNOTE_DIARIZATION,
                     DIAR_WINDOW_S, DIAR_HOP_S, DIAR_CLUSTER_THRESHOLD, SPEAKER_MATCH_THRESHOLD, LANG_CODES,
                     AUDIO_LID_MODELS, SPEAKER_DB, MOE_EXPERTS, BODHAN_ASR, BODHAN_DIR, NEMOTRON_ASR, NEMOTRON_PYTHON,
-                    LONG_CHUNK_S, JUDGE_CHUNK_S, MOE_MAX_CER, torch_device)
+                    LONG_CHUNK_S, JUDGE_CHUNK_S, MOE_MAX_CER, IC_LARGE_ONNX, torch_device)
 
 SR = 16000
 DEVICE = torch_device()
@@ -333,6 +333,18 @@ def bodhan_available():
         return False
 
 
+@lru_cache(maxsize=2)
+def get_ic_large(code):
+    """The language's IndicConformer-large as ONNX (CTC), through onnx-asr (torch is imported first: it provides the
+    cuDNN libraries ONNX Runtime needs on the GPU)."""
+    import onnx_asr
+    cuda = {"cudnn_conv_algo_search": "HEURISTIC", "gpu_mem_limit": 4 << 30, "arena_extend_strategy": "kSameAsRequested"}
+    providers = [("CUDAExecutionProvider", cuda), "CPUExecutionProvider"] if DEVICE == "cuda" else ["CPUExecutionProvider"]
+    with MODEL_LOCK:
+        return onnx_asr.load_model(IC_LARGE_ONNX.format(code=code), str(MODELS_DIR / f"indicconformer-{code}-onnx"),
+                                   providers=providers)
+
+
 def main_asr_for(language):
     """(engine, model name for the reports) of the main ASR of a language."""
     if ASR_ENGINE == "bodhan" and (language in INDICCONFORMER_LANGS or language == "English") and bodhan_available():
@@ -350,6 +362,7 @@ def experts_for(language):
     indic, english = language in INDICCONFORMER_LANGS, language == "English"
     candidates = [("bodhan", BODHAN_ASR, indic or english),
                   ("indicconformer", f"{INDICCONFORMER} ({INDICCONFORMER_DECODER.upper()})", indic),
+                  ("ic_large", IC_LARGE_ONNX.format(code=INDICCONFORMER_LANGS.get(language, "")), indic),
                   ("whisper", ENGLISH_ASR, english), ("nemotron", NEMOTRON_ASR, english),
                   ("wav2vec2", None, True)]
     return [(e, m or asr_model_for(language)) for e, m, covers in candidates
@@ -398,6 +411,14 @@ def transcribe_pieces(pieces, source_lang, engine):
         if "error" in reply:
             raise RuntimeError(f"Nemotron worker: {reply['error']}")
         return reply["texts"]
+    if engine == "ic_large":
+        model = get_ic_large(INDICCONFORMER_LANGS[source_lang])
+        texts = []
+        for i in range(0, len(pieces), 16):   # a whole file in one batch needs more than the 4 GB arena
+            with MODEL_LOCK:
+                texts += [" ".join(str(t).split()) for t in model.recognize(
+                    [p.astype(np.float32) for p in pieces[i:i + 16]], sample_rate=SR)]
+        return texts
     if engine == "wav2vec2":
         engine = "wav2vec"
     if engine == "whisper":

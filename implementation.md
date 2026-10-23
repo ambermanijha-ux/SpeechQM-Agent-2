@@ -106,7 +106,7 @@ Implementation types: **model** = fixed code around a speech/text model; **code*
 
 | # | Check | Output (`results/`) | Type | Notes |
 |---|---|---|---|---|
-| 1 | ASR transcription | `indicconf_hypothesis.csv`, `asr_experts.csv`, `asr_moe.csv`, `asr_chunks.csv` | model | Bodhan Indic-Transcribe-Flex for 14 Indic languages and English (fallback: IndicConformer-600M / Whisper-large-v3); ASR experts for the MoE score: IndicConformer (Indic), Whisper and NVIDIA Nemotron (English), and wav2vec2 (6.2) |
+| 1 | ASR transcription | `indicconf_hypothesis.csv`, `asr_experts.csv`, `asr_moe.csv`, `asr_chunks.csv` | model | Bodhan Indic-Transcribe-Flex for 14 Indic languages and English (fallback: IndicConformer-600M / Whisper-large-v3); ASR experts for the MoE score: IndicConformer-600M and the language's IndicConformer-large (ONNX, CTC) (Indic), Whisper and NVIDIA Nemotron (English), and wav2vec2 (6.2) |
 | 2 | Speakers and durations | `num_speakers.csv` | model | pyannote or local diarization, global speaker IDs across files and batches (`speaker_db/`), speech and overlap seconds (6.3) |
 | 3 | Transcript quality | `transcript_quality.csv` | code | fails: ≤ 3 words, > 20 % repeated 4-word phrases (loops), < 5 letters per second of speech (ASR dropped speech), or MoE verdict: no two ASR models agree within 50 % of the characters (`MOE_MAX_CER`), or two experts agree and the main transcript differs from both; adds `MoE_WER`, `MoE_CER`, `Main_Agreement_CER`, `MoE_Verdict` |
 | 4 | Characters (graphemes) | `character_list.csv` | agent | |

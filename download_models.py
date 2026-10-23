@@ -16,7 +16,7 @@ from huggingface_hub.errors import HfHubHTTPError
 
 from config import (ASR_MODELS, ALIGN_MODEL, INDICBERT_TOKENIZER, INDICLID_DIR, OLLAMA_BASE_URL, PLANNER_MODEL, JUDGE_MODEL, MONITOR_MODEL,
                     ASR_ENGINE, INDICCONFORMER, INDICCONFORMER_LANGS, ENGLISH_ASR, AUDIO_LID_MODELS,
-                    CODER_MODEL, MOE_EXPERTS, BODHAN_ASR, NEMOTRON_ASR, NEMOTRON_PYTHON)
+                    CODER_MODEL, MOE_EXPERTS, BODHAN_ASR, NEMOTRON_ASR, NEMOTRON_PYTHON, IC_LARGE_ONNX)
 
 INDICLID_URL = "https://github.com/AI4Bharat/IndicLID/releases/download/v1.0/"
 INDICLID = {"indiclid-ftn": "model_baseline_roman.bin", "indiclid-ftr": "model_baseline_roman.bin",
@@ -101,6 +101,11 @@ def ensure_hf(languages, speech_backend="pyannote"):
             U.get_bodhan()
         else:
             print(f"  skipped {BODHAN_ASR}: accept its terms on Hugging Face (until then IndicConformer / Whisper is the main ASR)")
+    if "ic_large" in MOE_EXPERTS:
+        for lang in languages:
+            if lang in INDICCONFORMER_LANGS:
+                print(f"hf: {IC_LARGE_ONNX.format(code=INDICCONFORMER_LANGS[lang])} (MoE expert, ~0.5 GB)")
+                U.get_ic_large(INDICCONFORMER_LANGS[lang])
     if "nemotron" in MOE_EXPERTS and "English" in languages:
         print(f"hf: {NEMOTRON_ASR} (MoE expert, ~2.5 GB)")
         snapshot_download(NEMOTRON_ASR, allow_patterns=HF_WEIGHTS)

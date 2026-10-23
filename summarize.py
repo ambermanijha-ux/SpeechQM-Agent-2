@@ -23,7 +23,7 @@ COLUMNS = {
                                              "Audio_Language": "Audio_Language", "Audio_Confidence": "Audio_LID_Confidence",
                                              "Audio_Matches_Expected": "Audio_Language_OK"},
     "language_verification.csv": {"*_Share": "Script_Share", "Is_*": "Script_OK"},
-    "wer.csv": {"WER": "WER", "CER": "CER", "WER_bodhan": "WER_Bodhan", "WER_indicconformer": "WER_IndicConformer",
+    "wer.csv": {"WER": "WER", "CER": "CER", "WER_bodhan": "WER_Bodhan", "WER_indicconformer": "WER_IndicConformer", "WER_ic_large": "WER_IndicConformer_Large",
                 "WER_whisper": "WER_Whisper", "WER_nemotron": "WER_Nemotron", "WER_wav2vec2": "WER_wav2vec2",
                 "Segment_WER": "Segment_WER",
                 "Segment_WER_No_Cross_Talk": "Segment_WER_No_Cross_Talk", "Bad_Segment_Share": "Bad_Segment_Share"},
