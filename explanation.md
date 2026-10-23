@@ -742,7 +742,8 @@ task prompts in `llm.py`, but run the tool on data you are allowed to process, a
   the per-chunk texts with their times. An expert that fails is left out with a warning.
 - `moe_score({model: text})`: the MoE score (the paper's "WER/CER across several ASR models", which it never
   defines): mean WER and CER over all pairs of models (both ways round, punctuation removed, each capped at 1), the
-  CER between the main transcript and the closest expert, the pair of models closest to each other, the model furthest
+  CER between the main transcript and the closest expert, the pair of models closest to each other (from different
+  families when possible: `ASR_FAMILY` puts the two IndicConformers in one, since their errors are correlated), the model furthest
   from the others, and `MoE_Verdict`, which task 3 uses: `no agreement` when even the closest pair differs on more than
   `MOE_MAX_CER` (0.5) of the characters, `main differs` when two experts agree and the main transcript is far from
   both, else `agrees`. One weak expert disagreeing with everyone does not fail the main transcript.

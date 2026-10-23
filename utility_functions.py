@@ -498,14 +498,20 @@ def words(text: str) -> list:
                    for i, ch in enumerate(t)).split()
 
 
-def moe_score(texts: dict, max_cer=0.5) -> dict:
+# ASR experts trained the same way make the same mistakes, so two of them agreeing does not confirm a transcript
+ASR_FAMILY = {"indicconformer": "indicconformer", "ic_large": "indicconformer"}
+
+
+def moe_score(texts: dict, max_cer=0.5, family=None) -> dict:
     """The MoE score of one file from {model: transcript}, the main ASR first. Compared lower-cased, without
     punctuation, both ways round (WER/CER are not symmetric), each capped at 1 so the score is the share that differs
     (a model that dropped most of the speech gave 3.6 against the longer transcripts in kn001): an empty against a
     non-empty transcript counts as 1.
       MoE_WER, MoE_CER: mean difference over all pairs of models;
       Main_Agreement_CER: CER between the main transcript and the closest expert;
-      Agreeing_Pair, Agreeing_Pair_CER: the two models closest to each other;
+      Agreeing_Pair, Agreeing_Pair_CER: the two models closest to each other, from different families when there is
+        such a pair (family: {model: family}, ASR_FAMILY by default; in kn001 the two IndicConformers agreed with each
+        other at 0.47 against a main transcript 50% longer);
       Least_Agreeing: with 3+ models, the one furthest from the others;
       MoE_Verdict (task 3): "no agreement" when even the closest pair differs on more than max_cer of the characters
       (the transcript cannot be confirmed: wrong language, unclear audio, or every expert weak), "main differs" when two
@@ -529,7 +535,8 @@ def moe_score(texts: dict, max_cer=0.5) -> dict:
     out = {"Experts": len(names), "MoE_WER": round(float(np.mean([diff(*p, False) for p in pairs])), 4),
            "MoE_CER": round(float(np.mean(list(cer.values()))), 4),
            "Main_Agreement_CER": round(min(c for (a, b), c in cer.items() if a == names[0]), 4)}
-    best = min(cer, key=cer.get)
+    fam = {n: (family or ASR_FAMILY).get(n, n) for n in names}
+    best = min([p for p in pairs if fam[p[0]] != fam[p[1]]] or pairs, key=cer.get)
     out.update({"Agreeing_Pair": "+".join(best), "Agreeing_Pair_CER": round(cer[best], 4)})
     if len(names) >= 3:
         out["Least_Agreeing"] = max(names, key=lambda n: np.mean([c for p, c in cer.items() if n in p]))
@@ -549,7 +556,7 @@ def transcribe_folder_to_csv(folder_path: str, source_language: str):
         return output_path
 
     results, expert_rows, moe_rows, chunk_rows = [], [], [], []
-    main_model = main_asr_for(source_language)[1]
+    main_engine, main_model = main_asr_for(source_language)
     for filename in sorted(os.listdir(folder_path)):
         audio_path = os.path.join(folder_path, filename)
         file_size = os.path.getsize(audio_path)
@@ -574,7 +581,8 @@ def transcribe_folder_to_csv(folder_path: str, source_language: str):
             expert_rows += [{"Filename": transcribe_filename, "Expert": e, "Model": m, "Hypothesis": t} for e, m, t in experts]
             if experts:
                 moe_rows.append({"Filename": transcribe_filename, "Main_ASR_Model": main_model,
-                                 **moe_score({"main": hypothesis, **{e: t for e, _, t in experts}}, MOE_MAX_CER)})
+                                 **moe_score({"main": hypothesis, **{e: t for e, _, t in experts}}, MOE_MAX_CER,
+                                             {**ASR_FAMILY, "main": ASR_FAMILY.get(main_engine, main_engine)})})
             logging.info(f"Transcribed {transcribe_filename}: {hypothesis[:50]}...")
         except Exception as e:
             logging.error(f"Failed to transcribe {transcribe_filename}: {e}")
