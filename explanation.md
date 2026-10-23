@@ -723,24 +723,27 @@ task prompts in `llm.py`, but run the tool on data you are allowed to process, a
   `ASR_MODELS[language]`; a gated model without access raises an error, so the next candidate (Vakyansh) is used.
 - `get_indicconformer()`: loads the model's ONNX sessions on the GPU with a memory cap. TorchScript fusion is off
   while it runs, because its feature extractor fails to compile with the CUDA 13 builds.
-- `get_bodhan()`: Bodhan Indic-Transcribe-Flex, an ASR expert for the Indic languages. Its code ships with the
+- `get_bodhan()`: Bodhan Indic-Transcribe-Flex, the main ASR for the Indic languages and English since 2026-10-23
+  (`bodhan_available()` falls back to IndicConformer / Whisper when it cannot load). Its code ships with the
   weights in `models/indic-transcribe-flex/` and is imported as the package `bodhan_flex`.
 - `get_nemotron()`: starts `nemotron_worker.py` in `.venv-nemotron` (Nemotron needs transformers >= 5.13; the main
   venv has 4.57) and keeps it for the run; pieces go to it as an `.npz` file, texts come back as JSON.
-- `experts_for(language)`: the ASR experts of a language (`MOE_EXPERTS`): Bodhan (Indic and English), Nemotron
-  (English), and
+- `experts_for(language)`: the ASR experts of a language (`MOE_EXPERTS`): every model covering the language other than
+  the main ASR: Bodhan, IndicConformer (Indic), Whisper and Nemotron (English), and
   the wav2vec2 model when it is not the main ASR.
-- `asr_chunks(audio, max_s, regions)`: speech regions merged into pieces of at most `max_s` seconds (8 s for the
-  main ASR and wav2vec2, 25 s for Bodhan and Nemotron, which do better on longer pieces). All models hear the same
+- `asr_chunks(audio, max_s, regions)`: speech regions merged into pieces of at most `max_s` seconds (25 s for Bodhan
+  and Nemotron, which do better on longer pieces, 8 s for the others; `asr_chunks.csv` has the main ASR's pieces). All models hear the same
   speech regions.
 - `transcribe_pieces(pieces, language, engine)`: one text per piece. IndicConformer's RNNT decoder returns nothing
   for some pieces (23 of 41 in the Gujarati file); those pieces get its CTC decoder's text (pooled WER 0.654 → 0.635).
 - `transcribe_audio(path, language, experts, chunks)`: the file's text; optionally also each ASR expert's text and
   the per-chunk texts with their times. An expert that fails is left out with a warning.
 - `moe_score({model: text})`: the MoE score (the paper's "WER/CER across several ASR models", which it never
-  defines): mean WER and CER over all pairs of models (both ways round, punctuation removed), the CER between the main
-  transcript and the closest expert (`Main_Agreement_CER`; task 3 fails a transcript above `MOE_MAX_CER`, 0.5), and
-  the model furthest from the others.
+  defines): mean WER and CER over all pairs of models (both ways round, punctuation removed, each capped at 1), the
+  CER between the main transcript and the closest expert, the pair of models closest to each other, the model furthest
+  from the others, and `MoE_Verdict`, which task 3 uses: `no agreement` when even the closest pair differs on more than
+  `MOE_MAX_CER` (0.5) of the characters, `main differs` when two experts agree and the main transcript is far from
+  both, else `agrees`. One weak expert disagreeing with everyone does not fail the main transcript.
 - `transcribe_folder_to_csv`: all audio files → `indicconf_hypothesis.csv` (`Filename`, `Indiconformer_Hypothesis`),
   `asr_experts.csv` (each expert's text), `asr_moe.csv` (the MoE score per file: a quality signal that needs no
   reference) and `asr_chunks.csv` (start, end and text of every chunk; the LLM judge scores these).

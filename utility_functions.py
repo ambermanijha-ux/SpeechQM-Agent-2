@@ -20,7 +20,7 @@ from config import (ASR_MODELS, ALIGN_MODEL, ASR_ENGINE, INDICCONFORMER, INDICCO
                     SPEECH_BACKEND, HF_TOKEN, PYANNOTE_VAD_MODEL, PYANNOTE_DIARIZATION,
                     DIAR_WINDOW_S, DIAR_HOP_S, DIAR_CLUSTER_THRESHOLD, SPEAKER_MATCH_THRESHOLD, LANG_CODES,
                     AUDIO_LID_MODELS, SPEAKER_DB, MOE_EXPERTS, BODHAN_ASR, BODHAN_DIR, NEMOTRON_ASR, NEMOTRON_PYTHON,
-                    EXPERT_CHUNK_S, torch_device)
+                    LONG_CHUNK_S, JUDGE_CHUNK_S, MOE_MAX_CER, torch_device)
 
 SR = 16000
 DEVICE = torch_device()
@@ -322,11 +322,24 @@ def get_nemotron():
     raise RuntimeError("Nemotron worker exited before loading the model")
 
 
+@lru_cache(maxsize=1)
+def bodhan_available():
+    """True once Bodhan loads (gated: without accepted terms the main ASR falls back to IndicConformer / Whisper)."""
+    try:
+        get_bodhan()
+        return True
+    except Exception as e:
+        logging.warning(f"{BODHAN_ASR} unavailable ({type(e).__name__}: {e}); main ASR: IndicConformer / Whisper")
+        return False
+
+
 def main_asr_for(language):
     """(engine, model name for the reports) of the main ASR of a language."""
-    if ASR_ENGINE == "best" and language in INDICCONFORMER_LANGS:
+    if ASR_ENGINE == "bodhan" and (language in INDICCONFORMER_LANGS or language == "English") and bodhan_available():
+        return "bodhan", BODHAN_ASR
+    if ASR_ENGINE in ("best", "bodhan") and language in INDICCONFORMER_LANGS:
         return "indicconformer", f"{INDICCONFORMER} ({INDICCONFORMER_DECODER.upper()})"
-    if ASR_ENGINE == "best" and language == "English":
+    if ASR_ENGINE in ("best", "bodhan") and language == "English":
         return "whisper", ENGLISH_ASR
     return "wav2vec", asr_model_for(language)
 
@@ -334,14 +347,13 @@ def main_asr_for(language):
 def experts_for(language):
     """[(expert, model name)] of the ASR experts that transcribe a file next to the main ASR (MoE score, task 3)."""
     main = main_asr_for(language)[0]
-    out = []
-    if "bodhan" in MOE_EXPERTS and (language in INDICCONFORMER_LANGS or language == "English"):
-        out.append(("bodhan", BODHAN_ASR))
-    if "nemotron" in MOE_EXPERTS and language == "English":
-        out.append(("nemotron", NEMOTRON_ASR))
-    if "wav2vec2" in MOE_EXPERTS and main != "wav2vec":
-        out.append(("wav2vec2", asr_model_for(language)))
-    return out
+    indic, english = language in INDICCONFORMER_LANGS, language == "English"
+    candidates = [("bodhan", BODHAN_ASR, indic or english),
+                  ("indicconformer", f"{INDICCONFORMER} ({INDICCONFORMER_DECODER.upper()})", indic),
+                  ("whisper", ENGLISH_ASR, english), ("nemotron", NEMOTRON_ASR, english),
+                  ("wav2vec2", None, True)]
+    return [(e, m or asr_model_for(language)) for e, m, covers in candidates
+            if covers and e in MOE_EXPERTS and e != main.replace("wav2vec", "wav2vec2")]
 
 
 def asr_model_for(language):
@@ -418,14 +430,17 @@ def transcribe_pieces(pieces, source_lang, engine):
 
 def transcribe_audio(audio_path, source_lang, experts=False, chunks=False):
     """Main ASR text of a file. experts: also [(expert, model, text)] from the ASR experts of experts_for();
-    chunks: also [(start s, end s, text)] per chunk. All models hear the same VAD speech regions: merged into
-    <= ASR_CHUNK_S seconds for the main ASR and wav2vec2, <= EXPERT_CHUNK_S for Bodhan and Nemotron."""
+    chunks: also [(start s, end s, text)] per chunk of <= JUDGE_CHUNK_S seconds, by the main ASR. All models hear the
+    same VAD speech regions: merged into <= LONG_CHUNK_S seconds for Bodhan and Nemotron, <= ASR_CHUNK_S for the others."""
     engine, name = main_asr_for(source_lang)
     print(f"Transcribing {audio_path} using {name} on {DEVICE}")
     audio_array = load_audio(audio_path)
     regions = speech_regions(audio_array)
     cut = lambda max_s: [(s, e) for s, e in asr_chunks(audio_array, max_s, regions) if (e - s) * SR >= SR // 10]
-    spans = cut(ASR_CHUNK_S)
+    long_engines = ("bodhan", "nemotron")
+    short = cut(ASR_CHUNK_S)
+    long = cut(LONG_CHUNK_S)
+    spans = long if engine in long_engines else short
     pieces = [audio_array[int(s * SR):int(e * SR)] for s, e in spans]
     texts = transcribe_pieces(pieces, source_lang, engine)
     text = " ".join(t for t in texts if t)
@@ -433,16 +448,20 @@ def transcribe_audio(audio_path, source_lang, experts=False, chunks=False):
         return text
     out = [text]
     if experts:
-        long_pieces = [audio_array[int(s * SR):int(e * SR)] for s, e in cut(EXPERT_CHUNK_S)]
+        cut_pieces = lambda sp: [audio_array[int(s * SR):int(e * SR)] for s, e in sp]
+        short_pieces, long_pieces = cut_pieces(short), cut_pieces(long)
         got = []
         for expert, model in experts_for(source_lang):
             try:   # an expert that cannot run leaves the MoE score with fewer models, not the file untranscribed
                 got.append((expert, model, " ".join(t for t in transcribe_pieces(
-                    long_pieces if expert in ("bodhan", "nemotron") else pieces, source_lang, expert) if t)))
+                    long_pieces if expert in long_engines else short_pieces, source_lang, expert) if t)))
             except Exception as e:
                 logging.warning(f"ASR expert {expert} failed on {audio_path}: {type(e).__name__}: {e}")
         out.append(got)
     if chunks:
+        if (LONG_CHUNK_S if engine in long_engines else ASR_CHUNK_S) != JUDGE_CHUNK_S:   # main ASR on other pieces
+            spans = cut(JUDGE_CHUNK_S)
+            texts = transcribe_pieces([audio_array[int(s * SR):int(e * SR)] for s, e in spans], source_lang, engine)
         out.append([(round(s, 2), round(e, 2), t) for (s, e), t in zip(spans, texts)])
     return tuple(out)
 
@@ -458,14 +477,19 @@ def words(text: str) -> list:
                    for i, ch in enumerate(t)).split()
 
 
-def moe_score(texts: dict) -> dict:
+def moe_score(texts: dict, max_cer=0.5) -> dict:
     """The MoE score of one file from {model: transcript}, the main ASR first. Compared lower-cased, without
     punctuation, both ways round (WER/CER are not symmetric), each capped at 1 so the score is the share that differs
     (a model that dropped most of the speech gave 3.6 against the longer transcripts in kn001): an empty against a
     non-empty transcript counts as 1.
       MoE_WER, MoE_CER: mean difference over all pairs of models;
-      Main_Agreement_CER: CER between the main transcript and the closest expert (task 3 fails it above MOE_MAX_CER);
-      Least_Agreeing: with 3+ models, the one furthest from the others."""
+      Main_Agreement_CER: CER between the main transcript and the closest expert;
+      Agreeing_Pair, Agreeing_Pair_CER: the two models closest to each other;
+      Least_Agreeing: with 3+ models, the one furthest from the others;
+      MoE_Verdict (task 3): "no agreement" when even the closest pair differs on more than max_cer of the characters
+      (the transcript cannot be confirmed: wrong language, unclear audio, or every expert weak), "main differs" when two
+      experts agree and the main transcript is further than max_cer from both, else "agrees". A single weak expert
+      that disagrees with everyone no longer counts against the main transcript."""
     import jiwer
     norm = {k: " ".join(words(v.lower())) for k, v in texts.items()}
 
@@ -484,8 +508,13 @@ def moe_score(texts: dict) -> dict:
     out = {"Experts": len(names), "MoE_WER": round(float(np.mean([diff(*p, False) for p in pairs])), 4),
            "MoE_CER": round(float(np.mean(list(cer.values()))), 4),
            "Main_Agreement_CER": round(min(c for (a, b), c in cer.items() if a == names[0]), 4)}
+    best = min(cer, key=cer.get)
+    out.update({"Agreeing_Pair": "+".join(best), "Agreeing_Pair_CER": round(cer[best], 4)})
     if len(names) >= 3:
         out["Least_Agreeing"] = max(names, key=lambda n: np.mean([c for p, c in cer.items() if n in p]))
+    main_to_pair = min(cer.get((names[0], b), cer.get((b, names[0]), 1.0)) for b in best if b != names[0]) \
+        if names[0] not in best else 0.0
+    out["MoE_Verdict"] = ("no agreement" if cer[best] > max_cer else "main differs" if main_to_pair > max_cer else "agrees")
     return out
 
 
@@ -524,7 +553,7 @@ def transcribe_folder_to_csv(folder_path: str, source_language: str):
             expert_rows += [{"Filename": transcribe_filename, "Expert": e, "Model": m, "Hypothesis": t} for e, m, t in experts]
             if experts:
                 moe_rows.append({"Filename": transcribe_filename, "Main_ASR_Model": main_model,
-                                 **moe_score({"main": hypothesis, **{e: t for e, _, t in experts}})})
+                                 **moe_score({"main": hypothesis, **{e: t for e, _, t in experts}}, MOE_MAX_CER)})
             logging.info(f"Transcribed {transcribe_filename}: {hypothesis[:50]}...")
         except Exception as e:
             logging.error(f"Failed to transcribe {transcribe_filename}: {e}")

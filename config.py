@@ -73,11 +73,12 @@ SCRIPTS = {"Hindi": ("Devanagari", 0x0900, 0x097F), "Sanskrit": ("Devanagari", 0
            "Nepali": ("Devanagari", 0x0900, 0x097F)}
 # CTC alignment model: Vakyansh Hindi for Hindi (as in the original), else the language's own ASR model
 ALIGN_MODEL = os.environ.get("ALIGN_MODEL", "Harveenchadha/vakyansh-wav2vec2-hindi-him-4200")
-# Main ASR (benchmark of 2026-10-22, qc_audit/asr_bench: pooled WER 0.66 vs 0.86 for the wav2vec2 models above on 10
-# reference files, better on 9 of 10): IndicConformer-600M for the Indic languages it covers, Whisper-large-v3 for
-# English. The wav2vec2 models of ASR_MODELS stay for CTC scoring and forced alignment and give a second ASR opinion.
-# ASR_ENGINE=wav2vec brings back the wav2vec2 models as the main ASR.
-ASR_ENGINE = os.environ.get("ASR_ENGINE", "best")
+# Main ASR (user decision 2026-10-23): Bodhan Indic-Transcribe-Flex for the 14 Indic languages and English; its WER
+# beat IndicConformer / Whisper on 9 of 11 reference files of the MoE run (mean 0.624 vs 0.671). Without access to it
+# (gated) the main ASR falls back to "best". ASR_ENGINE=best: IndicConformer-600M (Indic) and Whisper-large-v3
+# (English), the main ASR from 2026-10-22 (qc_audit/asr_bench: pooled WER 0.66 vs 0.86 for wav2vec2); ASR_ENGINE=wav2vec:
+# the wav2vec2 models of ASR_MODELS, which also do the CTC scoring and forced alignment.
+ASR_ENGINE = os.environ.get("ASR_ENGINE", "bodhan")
 INDICCONFORMER = "ai4bharat/indic-conformer-600m-multilingual"   # gated: accept its terms on Hugging Face
 INDICCONFORMER_DIR = MODELS_DIR / "indic-conformer-600m-multilingual"
 INDICCONFORMER_DECODER = os.environ.get("INDICCONFORMER_DECODER", "rnnt")   # rnnt (pooled WER 0.659) or ctc (0.666)
@@ -88,10 +89,10 @@ ENGLISH_ASR = os.environ.get("ENGLISH_ASR", "openai/whisper-large-v3")
 ASR_GPU_MEM_GB = float(os.environ.get("ASR_GPU_MEM_GB", "12"))   # ONNX Runtime arena cap (GPUs shared with Ollama)
 # MoE score (task 3; the paper's "WER/CER across several ASR models"): next to the main ASR, these ASR "experts"
 # transcribe every file, and how far the main transcript is from the experts scores it without a reference.
-# Indic: Bodhan Indic-Transcribe-Flex + the wav2vec2 model; English: NVIDIA Nemotron, Bodhan (Indian-accented
-# English) + the wav2vec2 model.
-# MOE_EXPERTS picks from bodhan, nemotron, wav2vec2 ("none": main ASR only).
-MOE_EXPERTS = [e.strip() for e in os.environ.get("MOE_EXPERTS", "bodhan,nemotron,wav2vec2").split(",")
+# Every model of the language that is not the main ASR: Indic: Bodhan Indic-Transcribe-Flex, IndicConformer, wav2vec2;
+# English: Bodhan (Indian-accented English), Whisper, NVIDIA Nemotron, wav2vec2.
+# MOE_EXPERTS picks from bodhan, indicconformer, whisper, nemotron, wav2vec2 ("none": main ASR only).
+MOE_EXPERTS = [e.strip() for e in os.environ.get("MOE_EXPERTS", "bodhan,indicconformer,whisper,nemotron,wav2vec2").split(",")
                if e.strip() and e.strip() != "none"]
 BODHAN_ASR = "bodhan-ai/indic-transcribe-flex"   # gated: accept its terms on Hugging Face
 BODHAN_DIR = MODELS_DIR / "indic-transcribe-flex"
@@ -99,7 +100,10 @@ NEMOTRON_ASR = os.environ.get("NEMOTRON_ASR", "nvidia/nemotron-speech-streaming-
 # Nemotron needs transformers >= 5.13 (the main .venv has 4.57): it runs in this venv as nemotron_worker.py
 NEMOTRON_PYTHON = os.environ.get("NEMOTRON_PYTHON") or str(HERE / ".venv-nemotron" /
                                                             ("Scripts/python.exe" if os.name == "nt" else "bin/python"))
-EXPERT_CHUNK_S = 25.0   # the experts get speech chunks of up to 25 s (Bodhan trains on <= 30 s; shorter costs it WER)
+LONG_CHUNK_S = 25.0   # Bodhan and Nemotron get speech chunks of up to 25 s (Bodhan trains on <= 30 s; shorter costs it WER)
+# the chunks of asr_chunks.csv (the LLM judge's chunk scores, task 17, and duplicates without references): the judge was
+# measured on 8 s chunks; when the main ASR works on 25 s pieces it also transcribes the 8 s pieces for this table
+JUDGE_CHUNK_S = float(os.environ.get("JUDGE_CHUNK_S", "8"))
 # task 3 fails a transcript when even the closest expert differs on more than this share of its characters
 MOE_MAX_CER = float(os.environ.get("MOE_MAX_CER", "0.5"))
 # Audio language ID (task 15, next to IndicLID on the text): both models hear up to 30 s of speech and the more

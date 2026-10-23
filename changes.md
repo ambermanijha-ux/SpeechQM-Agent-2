@@ -174,4 +174,7 @@ Measured before keeping: every change to a prompt or model below was compared on
 | WER (24) | WER and CER of every expert (`WER_bodhan`, `WER_nemotron`, `WER_wav2vec2`) | |
 | MoE score | pairwise differences capped at 1 (a model that drops most speech gave 3.5) | |
 | Setup | `requirements-nemotron.txt`; `setup.sh` / `setup.ps1` build `.venv-nemotron`; `download_models.py` fetches the experts | |
+| Main ASR (2026-10-23, user decision) | Bodhan Indic-Transcribe-Flex is the main ASR for the 14 Indic languages and English (`ASR_ENGINE=bodhan`; falls back to IndicConformer / Whisper when it cannot load; `ASR_ENGINE=best` for the old main ASR). IndicConformer and Whisper become MoE experts | full run `audios_qc_bodhan/`: WER 0.671 → 0.625 on 11 reference files (9 better), no empty chunks, task 3 passes 17/22 |
+| LLM judge chunks (17) | `asr_chunks.csv` keeps 8 s pieces (`JUDGE_CHUNK_S`): Bodhan transcribes 25 s pieces for the transcript and the 8 s pieces for the judge | `judge_bench.py` on Bodhan: chunk score vs file WER Spearman −0.56 with 8 s pieces, 0.00 with 25 s |
+| MoE verdict (3) | `MoE_Verdict`: `no agreement` (closest pair of models > 50 % CER apart) or `main differs` (two experts agree, the main transcript is far from both) fail; one weak expert disagreeing with everyone no longer fails the main transcript | same 5 failures on `audios_qc_bodhan/`, now with the right reason (e.g. gj001, kn001: no agreement, not a bad main transcript) |
 

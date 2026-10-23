@@ -86,19 +86,21 @@ def ensure_hf(languages, speech_backend="pyannote"):
         print(f"hf: {repo}")
         snapshot_download(repo, allow_patterns=HF_WEIGHTS)   # offline: resolves from the cache
     import utility_functions as U
-    if ASR_ENGINE == "best" and any(lang in INDICCONFORMER_LANGS for lang in languages):
-        print(f"hf: {INDICCONFORMER} (main ASR, ~2.4 GB)")
+    # IndicConformer and Whisper: the main ASR with ASR_ENGINE=best (and the fallback if Bodhan is gated), else experts
+    if ASR_ENGINE in ("best", "bodhan") and any(lang in INDICCONFORMER_LANGS for lang in languages):
+        print(f"hf: {INDICCONFORMER} (~2.4 GB)")
         U.get_indicconformer()
-    if ASR_ENGINE == "best" and "English" in languages:
-        print(f"hf: {ENGLISH_ASR} (English ASR, ~3 GB)")
+    if ASR_ENGINE in ("best", "bodhan") and "English" in languages:
+        print(f"hf: {ENGLISH_ASR} (~3 GB)")
         snapshot_download(ENGLISH_ASR, allow_patterns=HF_WEIGHTS)
     # ASR experts of the MoE score (task 3); one that cannot be downloaded only leaves the score with fewer models
-    if "bodhan" in MOE_EXPERTS and any(lang in INDICCONFORMER_LANGS or lang == "English" for lang in languages):
+    if ("bodhan" in MOE_EXPERTS or ASR_ENGINE == "bodhan") and any(lang in INDICCONFORMER_LANGS or lang == "English"
+                                                                   for lang in languages):
         if has_access(BODHAN_ASR):
-            print(f"hf: {BODHAN_ASR} (MoE expert, ~4.6 GB)")
+            print(f"hf: {BODHAN_ASR} (main ASR, ~4.6 GB)")
             U.get_bodhan()
         else:
-            print(f"  skipped {BODHAN_ASR}: accept its terms on Hugging Face to use it as an MoE expert")
+            print(f"  skipped {BODHAN_ASR}: accept its terms on Hugging Face (until then IndicConformer / Whisper is the main ASR)")
     if "nemotron" in MOE_EXPERTS and "English" in languages:
         print(f"hf: {NEMOTRON_ASR} (MoE expert, ~2.5 GB)")
         snapshot_download(NEMOTRON_ASR, allow_patterns=HF_WEIGHTS)

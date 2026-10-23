@@ -1142,9 +1142,12 @@ def transcript_quality_agent(state: CombinedStateDict) -> CombinedStateDict:
             moe = pd.read_csv(moe_path).drop(columns=["Main_ASR_Model"], errors="ignore")
             df = df.merge(moe, left_on=fcol, right_on="Filename", how="left", suffixes=("", "_moe"))
             df = df.drop(columns=[c for c in df.columns if c.endswith("_moe")])
-            disagree = (df["Quality_Check"] == "passed") & (pd.to_numeric(df["Main_Agreement_CER"], errors="coerce") > MOE_MAX_CER)
-            df.loc[disagree, "Quality_Check"] = df.loc[disagree, "Main_Agreement_CER"].map(
-                lambda c: f"failed: ASR experts disagree (closest expert differs on {c:.0%} of the characters)")
+            passed = df["Quality_Check"] == "passed"
+            for verdict, why in (("no agreement", "no two ASR models agree (closest pair differs on {:.0%} of the characters)"),
+                                 ("main differs", "two ASR experts agree, the main transcript differs from both (closest on {:.0%})")):
+                hit = passed & (df["MoE_Verdict"] == verdict)
+                col = "Agreeing_Pair_CER" if verdict == "no agreement" else "Main_Agreement_CER"
+                df.loc[hit, "Quality_Check"] = df.loc[hit, col].map(lambda c, w=why: "failed: " + w.format(c))
         output_path = os.path.join(os.path.dirname(csv_path), "transcript_quality.csv")
         df.to_csv(output_path, index=False)
         return {"transcript_quality_output": f"CSV saved at: {output_path}"}

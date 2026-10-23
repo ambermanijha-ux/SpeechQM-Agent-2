@@ -194,11 +194,12 @@ def language_info(language, seconds, failed):
     """ASR / alignment model actually used (the first candidate that loaded) and the run time."""
     from utility_functions import asr_model_for, align_model_for, main_asr_for
     try:
+        from utility_functions import experts_for
         engine, asr = main_asr_for(language)
-        second, align = (None if engine == "wav2vec" else asr_model_for(language)), align_model_for(language)
+        experts, align = [m for _, m in experts_for(language)], align_model_for(language)
     except Exception as e:
-        asr = second = align = f"unavailable ({type(e).__name__})"
-    return {"asr_model": asr, "second_asr_model": second, "align_model": align, "seconds": round(seconds), "failed": failed}
+        asr = experts = align = f"unavailable ({type(e).__name__})"
+    return {"asr_model": asr, "asr_experts": experts, "align_model": align, "seconds": round(seconds), "failed": failed}
 
 
 def main():
