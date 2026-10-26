@@ -1042,8 +1042,9 @@ def language_verification_agent(state: CombinedStateDict) -> CombinedStateDict:
         fcol = next(c for c in df.columns if c.lower() == "filename")
         tcol = next(c for c in df.columns if c.lower() in ("ground_truth", "transcription", "indiconformer_hypothesis"))
         texts = df[tcol].fillna("").astype(str)
-        def share(t):   # share of letters (tags removed) inside the script's Unicode block
-            letters = [ch for w in words(t) for ch in w if not ch.isdigit()]
+        def share(t):   # share of letters and vowel signs (tags removed) inside the script's Unicode block
+            # only letters and marks count: od001's 13 apostrophes (ପ୍ଲାନ୍'ଟା) made a correct Odia transcript 99.4 %
+            letters = [ch for w in words(t) for ch in w if unicodedata.category(ch)[0] in "LM"]
             return sum(lo <= ord(ch) <= hi for ch in letters) / len(letters) if letters else 0.0
         out = pd.DataFrame({"Filename": df[fcol], "Transcription": texts, f"{script}_Share": texts.apply(share).round(3)})
         out[col] = texts.apply(lambda t: bool(words(t)) and share(t) == 1.0)
